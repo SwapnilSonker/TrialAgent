@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+playwright
+openai  # or transformers if using Hugging Face
+langchain
+websockets
+python-multipart
+loguru
+watchdog
+pymongo
+psycopg2
+sqlite-utils
+asyncio
+subprocess32
+python-dotenv
+pydantic
+anthropic

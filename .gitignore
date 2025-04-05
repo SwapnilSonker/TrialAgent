@@ -3,3 +3,4 @@ scripts
 __pycache__/
 playwright_session
 .env
+sessions

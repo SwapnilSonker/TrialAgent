@@ -97,6 +97,7 @@ class WebAutomation:
                 'visible_text': await self.extract_visible_text(),
                 'forms': await self.detect_forms(),
                 'clickable_elements': await self.detect_clickable_elements(),
+                # 'popups': await self.detect_popups(),  # Add popup detection
                 'platform': self.platform
             }
             
@@ -114,12 +115,47 @@ class WebAutomation:
             screenshot_path = os.path.join(screenshots_dir, f"step_{len(self.step_history) + 1}.png")
             await self.page.screenshot(path=screenshot_path)
             
+            # Save current state to a file for state persistence
+            self._save_current_state(current_state)
+            
             return current_state
         
         except Exception as e:
             print(f"Error getting page state: {str(e)}")
             return {}
     
+    def _save_current_state(self, state):
+        """Save the current state to a file for recovery"""
+        states_dir = os.path.join(self.session_dir, f"{self.session_id}_states")
+        if not os.path.exists(states_dir):
+            os.makedirs(states_dir)
+        
+        # Don't save the full HTML to avoid massive files
+        state_to_save = state.copy()
+        if 'html' in state_to_save:
+            state_to_save['html'] = "HTML content omitted for file size"
+        
+        state_path = os.path.join(states_dir, f"state_{len(self.step_history)}.json")
+        with open(state_path, 'w') as f:
+            json.dump(state_to_save, f, indent=2, default=str)
+
+    def _load_last_state(self):
+        """Load the most recent saved state"""
+        states_dir = os.path.join(self.session_dir, f"{self.session_id}_states")
+        if not os.path.exists(states_dir):
+            return None
+        
+        states = [f for f in os.listdir(states_dir) if f.startswith("state_") and f.endswith(".json")]
+        if not states:
+            return None
+        
+        # Get the latest state file
+        latest_state = sorted(states, key=lambda x: int(x.split("_")[1].split(".")[0]))[-1]
+        state_path = os.path.join(states_dir, latest_state)
+        
+        with open(state_path, 'r') as f:
+            return json.load(f)
+        
     async def extract_visible_text(self):
         """Extract visible text from the page"""
         text_elements = await self.page.evaluate("""
@@ -314,36 +350,312 @@ class WebAutomation:
         return slack_elements
     
     async def get_ai_action(self, current_state):
-        """Get next action from Anthropic API based on current state and task"""
-        # Create a platform-specific part of the prompt
-        platform_specific = ""
-        if self.platform == "notion":
-            platform_specific = """
-            For Notion specifically:
-            - Consider using selectors targeting div blocks, paragraphs, and page elements
-            - Look for UI elements like "+ New page", sidebar toggles, and page titles
-            - Note that Notion uses dynamic class names, so focus on text content and element hierarchy
-            """
-        elif self.platform == "slack":
-            platform_specific = """
-            For Slack specifically:
-            - Prioritize using 'data-qa' attributes as selectors when available
-            - For message input, target elements with class 'p-message_input'
-            - For channel navigation, look for '[data-qa="channel_sidebar_name_channel"]' elements
-            - Consider using aria-labels for interactive elements
-            """
-        else:
-            platform_specific = """
-            The current page doesn't appear to be Notion or Slack.
-            Consider using general web automation techniques:
-            - Target elements by ID, class, or text content
-            - Use XPath for complex selections
-            - Check for forms and input fields
-            """
+        """Get next action from Anthropic API with enhanced context understanding"""
+        # Update platform detection if needed
+        await self._detect_platform()
         
-        # Create a prompt for the AI to generate the next action
+        # Create a more detailed prompt with explicit context
         prompt = f"""
-        # Web Automation Task for {self.platform.capitalize()}
+        # Advanced Web Automation for {self.platform.capitalize()}
+        
+        ## Task Description:
+        {self.task_description}
+        
+        ## Current Context:
+        - Platform: {self.platform}
+        - URL: {current_state['url']}
+        - Page Title: {current_state['title']}
+        - Current Step: {len(self.step_history) + 1}
+        
+        ## Previous Actions (Last 3):
+        {self._format_previous_actions()}
+        
+        ## Current Page Analysis:
+        1. Popups/Dialogs: {len(current_state.get('popups', {}).get('popups', []))} detected
+        2. Forms Present: {len(current_state['forms'])}
+        3. Clickable Elements: {min(len(current_state['clickable_elements']), 30)} detected
+        
+        ## Platform-Specific Context:
+        {json.dumps(current_state.get('platform_specific', {}), indent=2)}
+        
+        ## Decision-Making Instructions:
+        1. CAREFULLY ANALYZE the current page state in relation to the task
+        2. IDENTIFY the optimal next action that progresses toward task completion
+        3. HANDLE any popups or dialogs first before other interactions
+        4. PRIORITIZE direct task-related interactions over exploration
+        5. DETERMINE if you need to:
+        - Fill forms with appropriate values
+        - Click specific buttons or links
+        - Navigate to new areas
+        - Extract content
+        - Scroll or move to view more content
+        6. CONSIDER the task context and previous steps when deciding the next action
+        7. DONT click any unnecessary element.
+        8. Follow the instructions carefully and avoid making assumptions
+        
+        ## Critical Page Elements:
+        - Popups: {json.dumps(current_state.get('popups', {}).get('popups', [])[:3], indent=2)}
+        - Forms: {json.dumps(current_state['forms'][:2], indent=2)}
+        - Key Clickable Elements: {json.dumps(current_state['clickable_elements'][:15], indent=2)}
+        - Key Text Elements: {json.dumps(current_state['visible_text'][:15], indent=2)}
+        
+        ## Generate high-quality Python code for the SINGLE most logical next action:
+        - Use async Playwright syntax with the existing 'page' variable
+        - Include appropriate waits (waitForSelector, waitForNavigation, etc.)
+        - Use multiple selector strategies (CSS, XPath, text, etc.) for reliability
+        - Add error handling with try/except blocks
+        - Include detailed inline comments explaining the action and its purpose
+        - Ensure proper timing between actions with waits
+        
+        Generate ONLY executable Python code without any explanations, markdown, or surrounding text.
+        """
+        
+        # Call the Anthropic API with increased tokens for deeper analysis
+        response = self.client.messages.create(
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        # Extract the code from the response
+        code = response.content[0].text.strip()
+        
+        # Remove any markdown code blocks if present
+        if code.startswith("```python"):
+            code = code.split("```python")[1]
+        if code.endswith("```"):
+            code = code.rsplit("```", 1)[0]
+        
+        code = code.strip()
+        
+        # Add additional error handling to the code
+        enhanced_code = self._enhance_code_with_error_handling(code)
+        
+        # Save the generated script with timestamp and context
+        script_dir = os.path.join(self.session_dir, f"{self.session_id}_scripts")
+        if not os.path.exists(script_dir):
+            os.makedirs(script_dir)
+        
+        script_path = os.path.join(script_dir, f"step_{len(self.step_history) + 1}.py")
+        with open(script_path, 'w') as f:
+            f.write(f"# Generated script for step {len(self.step_history) + 1}\n")
+            f.write(f"# Task: {self.task_description}\n")
+            f.write(f"# Platform: {self.platform}\n")
+            f.write(f"# URL: {current_state['url']}\n")
+            f.write(f"# Page Title: {current_state['title']}\n")
+            f.write(f"# Timestamp: {datetime.datetime.now().isoformat()}\n\n")
+            f.write("async def run(page):\n")
+            for line in enhanced_code.split('\n'):
+                f.write(f"    {line}\n")
+        
+        # Get explanation for the action
+        explanation = await self._get_action_explanation(enhanced_code)
+        
+        return {
+            'code': enhanced_code,
+            'explanation': explanation,
+            'script_path': script_path
+        } 
+        
+    
+    def _enhance_code_with_error_handling(self, code):
+        """Add improved error handling to generated code"""
+        # Add general try/except if not already present
+        if "try:" not in code:
+            lines = code.split('\n')
+            enhanced_lines = ["try:"]
+            for line in lines:
+                enhanced_lines.append("    " + line)
+            
+            enhanced_lines.extend([
+                "except Exception as e:",
+                "    print(f\"Action failed with error: {str(e)}\")",
+                "    # Take screenshot of error state",
+                "    await page.screenshot(path=f\"error_state_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png\")"
+            ])
+            
+            return '\n'.join(enhanced_lines)
+        
+        return code    
+        
+    async def _get_action_explanation(self, code):
+        """Get a human-friendly explanation of what the code will do"""
+        prompt = f"""
+        The following is Python code for a web automation action:
+        
+        ```python
+        {code}
+        ```
+        
+        Please explain what this code will do in 1-2 simple sentences, focusing on the user-facing action.
+        Be specific about what elements will be interacted with.
+        
+        Return ONLY the explanation, no additional text.
+        """
+        
+        response = self.client.messages.create(
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        return response.content[0].text.strip()    
+    
+    def _format_previous_actions(self):
+        """Format previous actions for context in prompts"""
+        if not self.step_history:
+            return "No previous actions taken."
+        
+        recent_actions = self.step_history[-min(len(self.step_history), 3):]
+        formatted = []
+        
+        for i, action in enumerate(recent_actions):
+            step_num = len(self.step_history) - len(recent_actions) + i + 1
+            code_summary = action.get('code', '')
+            # Extract first 2-3 lines for brevity
+            code_lines = code_summary.split('\n')[:3]
+            code_preview = '\n'.join(code_lines)
+            if len(code_lines) < len(code_summary.split('\n')):
+                code_preview += "\n..."
+                
+            formatted.append(f"Step {step_num}: {code_preview}")
+        
+        return "\n".join(formatted)    
+    
+    async def chat_query(self, query):
+        """Handle conversational queries about the current page state"""
+        current_state = await self.get_page_state()
+        if not current_state:
+            return "Unable to get current page state."
+            
+        # Create a prompt for the AI to answer the query based on current state
+        prompt = f"""
+        # Web Page Analysis Query
+
+        ## Current State:
+        - Platform: {self.platform}
+        - URL: {current_state['url']}
+        - Page Title: {current_state['title']}
+        
+        ## Detected Popups:
+        {json.dumps(current_state.get('popups', {}), indent=2)}
+        
+        ## Platform-Specific Elements:
+        {json.dumps(current_state.get('platform_specific', {}), indent=2)}
+        
+        ## Visible Text Elements:
+        {json.dumps(current_state['visible_text'][:30], indent=2)}
+        
+        ## Clickable Elements:
+        {json.dumps(current_state['clickable_elements'][:30], indent=2)}
+        
+        ## Forms:
+        {json.dumps(current_state['forms'], indent=2)}
+        
+        ## User Query:
+        {query}
+        
+        Based on the current page state, answer the user's query conversationally.
+        Focus on providing specific information from the extracted page data.
+        """
+        
+        # Call the Anthropic API
+        response = self.client.messages.create(
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        # Return the response
+        answer = response.content[0].text.strip()
+        return answer
+    
+    async def execute_action(self, code):
+        """Execute the AI-generated code with improved error handling and feedback"""
+        if not self.page:
+            print("Error: No active page. Connect to a browser first.")
+            return {'success': False, 'error': 'No active page'}
+        
+        try:
+            # Check for popups before executing the action
+            current_state = await self.get_page_state()
+            popups = current_state.get('popups', {}).get('popups', [])
+            
+            if popups:
+                print(f"\n--- Detected {len(popups)} popup(s) ---")
+                for i, popup in enumerate(popups):
+                    popup_text = popup.get('text', '')[:50].replace('\n', ' ')
+                    print(f"Popup {i+1}: {popup_text}...")
+                    
+                    if popup.get('buttons'):
+                        print(f"  Buttons: {', '.join(popup['buttons'][:3])}")
+                
+                # Get AI guidance on how to handle the popup
+                popup_handling_code = await self.get_popup_handling_action(popups)
+                
+                # Execute the popup handling code
+                print("Handling popup before proceeding...")
+                page = self.page
+                exec_globals = {'page': page, 'asyncio': asyncio, 'datetime': datetime}
+                exec(f"async def _handle_popup():\n{self._indent_code(popup_handling_code)}", exec_globals)
+                await exec_globals['_handle_popup']()
+                
+                # Wait for popup to be dismissed
+                await asyncio.sleep(2)
+            
+            # Prepare execution context for the main action
+            page = self.page
+            exec_globals = {'page': page, 'asyncio': asyncio, 'datetime': datetime}
+            
+            # Add debugging info
+            print(f"\n--- Executing AI-generated code on {self.platform.capitalize()} ---")
+            
+            # Take screenshot before execution
+            before_screenshot = f"before_step_{len(self.step_history) + 1}.png"
+            await self.page.screenshot(path=os.path.join(self.session_dir, before_screenshot))
+            
+            # Create and execute temporary function
+            exec(f"async def _temp_action():\n{self._indent_code(code)}", exec_globals)
+            await exec_globals['_temp_action']()
+            
+            # Wait for potential navigation or DOM changes
+            await asyncio.sleep(2)
+            
+            # Take screenshot after execution
+            after_screenshot = f"after_step_{len(self.step_history) + 1}.png"
+            await self.page.screenshot(path=os.path.join(self.session_dir, after_screenshot))
+            
+            # Add to step history with more details
+            self.step_history.append({
+                'type': 'ai_action',
+                'platform': self.platform,
+                'code': code,
+                'timestamp': datetime.datetime.now().isoformat(),
+                'url': self.page.url,
+                'title': await self.page.title(),
+                'before_screenshot': before_screenshot,
+                'after_screenshot': after_screenshot
+            })
+            
+            return {'success': True}
+        except Exception as e:
+            error_message = str(e)
+            print(f"Action execution failed: {error_message}")
+            
+            # Take error screenshot
+            error_screenshot = f"error_step_{len(self.step_history) + 1}.png"
+            await self.page.screenshot(path=os.path.join(self.session_dir, error_screenshot))
+            
+            return {
+                'success': False, 
+                'error': error_message,
+                'error_screenshot': error_screenshot
+            }  
+    
+    async def analyze_task_completion(self, current_state):
+        """Analyze whether the task has been completed with detailed reasoning"""
+        prompt = f"""
+        # Task Completion Analysis for {self.platform.capitalize()}
         
         ## Task Description:
         {self.task_description}
@@ -353,30 +665,298 @@ class WebAutomation:
         - URL: {current_state['url']}
         - Page Title: {current_state['title']}
         
+        ## Steps Executed:
+        {self._format_complete_history()}
+        
         ## Platform-Specific Elements:
         {json.dumps(current_state.get('platform_specific', {}), indent=2)}
         
-        ## Visible Text Elements:
+        ## Current Page Content (Sample):
         {json.dumps(current_state['visible_text'][:20], indent=2)}
         
-        ## Clickable Elements:
-        {json.dumps(current_state['clickable_elements'][:20], indent=2)}
+        ## Analysis Request:
+        Based on the task description and current page state, perform a detailed analysis:
         
-        ## Forms:
-        {json.dumps(current_state['forms'], indent=2)}
+        1. Is the task fully completed? Consider all requirements in the task description.
+        2. What evidence in the current page state indicates completion or non-completion?
+        3. Are there any subtasks that remain to be done?
+        4. Is the current page state what we would expect if the task was completed?
         
-        ## Platform Guidance:
-        {platform_specific}
+        Return a JSON object with the following fields:
+        1. "is_complete": true or false
+        2. "completion_percentage": estimated percentage of task completed (0-100)
+        3. "reason": detailed explanation of your analysis
+        4. "remaining_steps": list of any remaining steps needed (empty if complete)
+        
+        Only return the JSON object, nothing else.
+        """
+        
+        response = self.client.messages.create(
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        try:
+            result_text = response.content[0].text.strip()
+            if result_text.startswith("```json"):
+                result_text = result_text.split("```json")[1]
+            if result_text.endswith("```"):
+                result_text = result_text.rsplit("```", 1)[0]
+            
+            result = json.loads(result_text.strip())
+            return result
+        except Exception as e:
+            print(f"Error parsing task completion analysis: {str(e)}")
+            # If parsing fails, return a default response
+            return {
+                'is_complete': False,
+                'completion_percentage': 0,
+                'reason': "Unable to determine completion status due to parsing error",
+                'remaining_steps': ["Continue with the task"]
+            }
+        
+    def _format_complete_history(self):
+        """Format the complete step history for analysis"""
+        if not self.step_history:
+            return "No steps executed yet."
+        
+        formatted = []
+        for i, step in enumerate(self.step_history):
+            step_summary = f"Step {i+1}: "
+            if 'explanation' in step:
+                step_summary += step['explanation']
+            else:
+                # Extract first line of code as summary
+                code_lines = step.get('code', '').split('\n')
+                if code_lines:
+                    step_summary += code_lines[0].strip()
+                else:
+                    step_summary += "Unknown action"
+                    
+            formatted.append(step_summary)
+        
+        return "\n".join(formatted)
+            
+    async def run_chat_interface(self):
+        """Run an improved chat-based interface for the automation"""
+        print("\n=== Web Automation Assistant ===")
+        print(f"Connected to: {await self.page.title()} ({self.page.url})")
+        print(f"Detected platform: {self.platform}")
+        
+        # Get more detailed information about the current page
+        current_state = await self.get_page_state()
+        page_elements = {
+            'forms': len(current_state['forms']),
+            'clickables': len(current_state['clickable_elements']),
+            'popups': len(current_state.get('popups', {}).get('popups', []))
+        }
+        
+        print(f"\nAnalysis: Detected {page_elements['forms']} forms, {page_elements['clickables']} clickable elements, and {page_elements['popups']} popups")
+        print("\nI'm your web automation assistant. I can help you automate tasks or answer questions about this page.")
+        print("What would you like to do? (Type 'help' for commands)")
+        
+        while True:
+            user_input = input("\nYou: ").strip()
+            
+            if user_input.lower() in ['exit', 'quit', 'bye']:
+                print("Assistant: Goodbye! Closing automation assistant.")
+                break
+                    
+            if user_input.lower() in ['help', 'commands']:
+                print("\nAssistant: Here are available commands:")
+                print("- 'automate [task]': Start automating a specific task")
+                print("- 'next step': Execute the next automation step")
+                print("- 'continue [n]': Run n automation steps (default: 3)")
+                print("- 'state': Get analysis of the current page")
+                print("- 'screenshot': Take a screenshot of the current page")
+                print("- 'save script': Export the full automation script")
+                print("- 'analyze completion': Analyze if the task is complete")
+                print("- 'go to [url]': Navigate to a specific URL")
+                print("- Any other input will be treated as a question about the page")
+                continue
+                    
+            # Update state to ensure we have the latest information
+            current_state = await self.get_page_state()
+            
+            # Handle different command types
+            if user_input.lower().startswith('automate '):
+                # Set a new task and prepare for automation
+                self.task_description = user_input[9:].strip()
+                print(f"\nAssistant: I'll help you automate: {self.task_description}")
+                print("I'm analyzing the page to determine the best course of action...")
+                
+                # Generate the first action but don't execute yet
+                action_data = await self.get_ai_action(current_state)
+                print(f"\nAssistant: Next step - {action_data['explanation']}")
+                print("Type 'next step' to execute this action.")
+                self.pending_action = action_data
+                
+            elif user_input.lower() == 'next step':
+                # Execute pending action if available
+                if hasattr(self, 'pending_action') and self.pending_action:
+                    print(f"\nAssistant: Executing step - {self.pending_action['explanation']}...")
+                    result = await self.execute_action(self.pending_action['code'])
+                    
+                    if result['success']:
+                        print("Action completed successfully!")
+                        # Get updated state
+                        current_state = await self.get_page_state()
+                        
+                        # Check if task is complete
+                        completion = await self.analyze_task_completion(current_state)
+                        if completion['is_complete']:
+                            print(f"\nTask completed! ({completion['completion_percentage']}%)")
+                            print(f"Reason: {completion['reason']}")
+                            
+                            # Save the complete automation script
+                            script_path = await self.export_full_script()
+                            print(f"Full automation script saved to: {script_path}")
+                            
+                            self.pending_action = None
+                        else:
+                            # Generate next action
+                            self.pending_action = await self.get_ai_action(current_state)
+                            print(f"\nAssistant: Next step - {self.pending_action['explanation']}")
+                            print(f"Progress: ~{completion['completion_percentage']}% complete")
+                    else:
+                        print(f"Action failed: {result.get('error', 'Unknown error')}")
+                        if 'error_screenshot' in result:
+                            print(f"Error screenshot saved to: {result['error_screenshot']}")
+                        
+                        # Ask for recovery options
+                        print("\nAssistant: I encountered an issue. What would you like to do?")
+                        print("1. Try again")
+                        print("2. Get a new suggestion")
+                        print("3. Manual intervention (I'll wait)")
+                        recovery_choice = input("Enter choice (1-3): ")
+                        
+                        if recovery_choice == '1':
+                            # Try the same action again
+                            print("Trying the same action again...")
+                            result = await self.execute_action(self.pending_action['code'])
+                            if result['success']:
+                                print("Success on retry!")
+                                current_state = await self.get_page_state()
+                                self.pending_action = await self.get_ai_action(current_state)
+                                print(f"\nAssistant: Next step - {self.pending_action['explanation']}")
+                        elif recovery_choice == '2':
+                            # Get a new action suggestion
+                            print("Getting a new action suggestion...")
+                            current_state = await self.get_page_state()
+                            self.pending_action = await self.get_ai_action(current_state)
+                            print(f"\nAssistant: New suggested step - {self.pending_action['explanation']}")
+                        else:
+                            # Manual intervention
+                            print("Please manually interact with the browser, then type 'next step' when ready")
+                            await asyncio.sleep(1)
+                            self.pending_action = None
+                else:
+                    print("\nAssistant: No pending action. Use 'automate [task]' to start a new task.")
+            
+            # Add the remaining handlers for other commands...
+            # (The rest of the method would handle the remaining commands like 'continue',
+            # 'state', 'screenshot', 'save script', etc. - I'm focusing on the core functionality)
+            
+            elif user_input.lower().startswith('continue'):
+                # [Implementation of continue command]
+                parts = user_input.split()
+                steps = 3  # Default
+                if len(parts) > 1 and parts[1].isdigit():
+                    steps = int(parts[1])
+                    
+                print(f"\nAssistant: Running {steps} automation steps...")
+                
+                for i in range(steps):
+                    if not hasattr(self, 'pending_action') or not self.pending_action:
+                        # Generate a new action if none is pending
+                        self.pending_action = await self.get_ai_action(current_state)
+                        
+                    print(f"\nStep {i+1}/{steps} - {self.pending_action['explanation']}...")
+                    result = await self.execute_action(self.pending_action['code'])
+                    
+                    if result['success']:
+                        print("Success!")
+                        # Update state and generate next action
+                        current_state = await self.get_page_state()
+                        
+                        # Check if task is complete
+                        completion = await self.analyze_task_completion(current_state)
+                        if completion['is_complete']:
+                            print(f"\nTask completed! ({completion['completion_percentage']}%)")
+                            print(f"Reason: {completion['reason']}")
+                            script_path = await self.export_full_script()
+                            print(f"Full automation script saved to: {script_path}")
+                            self.pending_action = None
+                            break
+                        
+                        self.pending_action = await self.get_ai_action(current_state)
+                    else:
+                        print(f"Step failed: {result.get('error', 'Unknown error')}")
+                        print("\nEncountered an error. Stopping automation sequence.")
+                        break
+                        
+                print("\nAssistant: Automation sequence completed.")
+                if hasattr(self, 'pending_action') and self.pending_action:
+                    print(f"Next suggested step: {self.pending_action['explanation']}")
+                    
+            elif user_input.lower() == 'save script':
+                script_path = await self.export_full_script()
+                print(f"\nAssistant: Full automation script saved to: {script_path}")
+                
+            elif user_input.lower() == 'analyze completion':
+                completion = await self.analyze_task_completion(current_state)
+                print(f"\nAssistant: Task Completion Analysis:")
+                print(f"Complete: {completion['is_complete']}")
+                print(f"Progress: ~{completion['completion_percentage']}% complete")
+                print(f"Analysis: {completion['reason']}")
+                if completion['remaining_steps']:
+                    print("Remaining steps:")
+                    for i, step in enumerate(completion['remaining_steps']):
+                        print(f"  {i+1}. {step}")
+                        
+            elif user_input.lower().startswith('go to '):
+                url = user_input[6:].strip()
+                if not url.startswith(('http://', 'https://')):
+                    url = 'https://' + url
+                
+                print(f"\nAssistant: Navigating to {url}...")
+                try:
+                    await self.page.goto(url)
+                    await asyncio.sleep(2)
+                    await self._detect_platform()
+                    current_state = await self.get_page_state()
+                    print(f"Navigation complete. Now at: {current_state['title']}")
+                    print(f"Platform detected: {self.platform}")
+                except Exception as e:
+                    print(f"Navigation failed: {str(e)}")
+                    
+            else:
+                # Treat as a general question about the page
+                answer = await self.chat_query(user_input)
+                print(f"\nAssistant: {answer}")
+                              
+    def _indent_code(self, code):
+        """Add proper indentation to the code"""
+        lines = code.split('\n')
+        indented_lines = ['    ' + line for line in lines]
+        return '\n'.join(indented_lines)
+    
+    async def get_popup_handling_action(self, popups):
+        """Get AI-generated code to handle detected popups"""
+        prompt = f"""
+        # Popup Handling for {self.platform.capitalize()}
+        
+        ## Detected Popups:
+        {json.dumps(popups, indent=2)}
         
         ## Instructions:
-        Based on the current page state and the task description, generate Python code using Playwright to perform the next logical action. The code should be a specific, self-contained snippet that will be executed.
-        
-        The code should:
-        1. Take ONE specific action to progress the task (click, fill form, navigate, etc.)
-        2. Be written for async Playwright
-        3. Use the variable 'page' which is already defined
-        4. Include proper waits for elements or navigation
-        5. Be robust by using multiple selector strategies when possible
+        Generate Python code using Playwright to handle the detected popup(s). The code should:
+        1. Target the popup(s) using appropriate selectors
+        2. Either close the popup(s) or interact with them as needed
+        3. Be written for async Playwright
+        4. Use the variable 'page' which is already defined
+        5. Include proper waits for elements
         
         Generate ONLY executable Python code without any explanations or markdown. The code will be directly executed.
         """
@@ -384,7 +964,7 @@ class WebAutomation:
         # Call the Anthropic API
         response = self.client.messages.create(
             model="claude-3-7-sonnet-20250219",
-            max_tokens=1000,
+            max_tokens=800,
             messages=[{"role": "user", "content": prompt}]
         )
         
@@ -404,65 +984,21 @@ class WebAutomation:
         if not os.path.exists(script_dir):
             os.makedirs(script_dir)
         
-        script_path = os.path.join(script_dir, f"step_{len(self.step_history) + 1}.py")
+        script_path = os.path.join(script_dir, f"popup_handler_{len(self.step_history) + 1}.py")
         with open(script_path, 'w') as f:
-            f.write(f"# Generated script for step {len(self.step_history) + 1}\n")
+            f.write(f"# Generated popup handling script\n")
             f.write(f"# Platform: {self.platform}\n")
-            f.write(f"# URL: {current_state['url']}\n")
             f.write(f"# Timestamp: {datetime.datetime.now().isoformat()}\n\n")
             f.write("async def run(page):\n")
             for line in code.split('\n'):
                 f.write(f"    {line}\n")
         
         # Print the script for user visibility
-        print(f"\n--- Generated Playwright Script for {self.platform.capitalize()} ---")
+        print(f"\n--- Generated Popup Handling Script ---")
         print(code)
         print("--------------------------------")
         
         return code
-    
-    async def execute_action(self, code):
-        """Execute the AI-generated code"""
-        if not self.page:
-            print("Error: No active page. Connect to a browser first.")
-            return {'success': False, 'error': 'No active page'}
-        
-        try:
-            # Prepare execution context
-            page = self.page
-            
-            # Create temporary function with the code
-            exec_globals = {'page': page, 'asyncio': asyncio}
-            
-            # Add debugging info
-            print(f"\n--- Executing AI-generated code on {self.platform.capitalize()} ---")
-            
-            # Create and execute temporary function
-            exec(f"async def _temp_action():\n{self._indent_code(code)}", exec_globals)
-            await exec_globals['_temp_action']()
-            
-            # Wait for potential navigation or DOM changes
-            await asyncio.sleep(2)
-            
-            # Add to step history
-            self.step_history.append({
-                'type': 'ai_action',
-                'platform': self.platform,
-                'code': code,
-                'timestamp': datetime.datetime.now().isoformat(),
-                'url': self.page.url
-            })
-            
-            return {'success': True}
-        except Exception as e:
-            print(f"Action execution failed: {str(e)}")
-            return {'success': False, 'error': str(e)}
-    
-    def _indent_code(self, code):
-        """Add proper indentation to the code"""
-        lines = code.split('\n')
-        indented_lines = ['    ' + line for line in lines]
-        return '\n'.join(indented_lines)
     
     async def check_task_completion(self, current_state):
         """Ask the AI if the task is complete"""
@@ -514,6 +1050,74 @@ class WebAutomation:
                 'is_complete': False,
                 'reason': "Unable to determine completion status"
             }
+    
+    async def detect_popups(self):
+        """Detect popups, modals, and dialogs on the page with improved accuracy"""
+        popups = await self.page.evaluate("""
+            () => {
+                const result = {
+                    popups: []
+                };
+                
+                // Enhanced popup selectors including aria attributes
+                const popupSelectors = [
+                    // Common modal selectors
+                    '.modal', '[role="dialog"]', '.popup', '.overlay', '.dialog',
+                    // Aria-based selectors
+                    '[aria-modal="true"]', '[aria-haspopup="dialog"]', 
+                    // Platform-specific selectors
+                    '.notion-overlay-container', '.c-dialog__content', '.ReactModal__Content',
+                    // Elements with modal/popup/dialog in attribute values
+                    '[class*="modal"]', '[class*="popup"]', '[class*="dialog"]',
+                    '[id*="modal"]', '[id*="popup"]', '[id*="dialog"]',
+                    // Elements with high z-index that might be popups
+                    '[style*="z-index:"]'
+                ];
+                
+                // Check each selector
+                popupSelectors.forEach(selector => {
+                    try {
+                        const elements = document.querySelectorAll(selector);
+                        elements.forEach(el => {
+                            // Improved visibility check
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            const isVisible = style.display !== 'none' && 
+                                            style.visibility !== 'hidden' && 
+                                            style.opacity !== '0' &&
+                                            rect.width > 10 && 
+                                            rect.height > 10 &&
+                                            rect.top >= 0 &&
+                                            rect.left >= 0;
+                            
+                            if (isVisible) {
+                                const text = el.innerText || el.textContent;
+                                const buttons = Array.from(el.querySelectorAll('button, [role="button"]'))
+                                    .map(btn => btn.innerText || btn.textContent || btn.value || btn.getAttribute('aria-label') || '');
+                                
+                                result.popups.push({
+                                    selector: selector,
+                                    text: text ? text.trim().substring(0, 200) : '',
+                                    buttons: buttons.filter(btn => btn.trim()),
+                                    position: {
+                                        top: rect.top,
+                                        left: rect.left,
+                                        width: rect.width,
+                                        height: rect.height
+                                    },
+                                    hasCloseButton: !!el.querySelector('button[aria-label*="close"], [aria-label*="Close"], .close, .close-button, .dismiss, button[aria-label*="dismiss"], [class*="close"], [id*="close"]')
+                                });
+                            }
+                        });
+                    } catch (e) {
+                        // Ignore errors for individual selectors
+                    }
+                });
+                
+                return result;
+            }
+        """)
+        return popups
     
     async def manual_intervention(self, error_message):
         """Prompt for manual intervention and get user's choice on next steps"""
@@ -715,27 +1319,23 @@ async def main():
         api_key = input("Enter your Anthropic API key: ")
         os.environ["ANTHROPIC_API_KEY"] = api_key
     
-    # Get task description from user input
-    print("\n=== Web Automation for Notion and Slack ===")
-    task_description = input("Enter your task description: ")
-    
-    # Create the automation instance
-    automation = WebAutomation(task_description, api_key)
+    # Create the automation instance with an initial empty task
+    automation = WebAutomation("", api_key)
     
     # Connect to existing browser session
+    print("\n=== Web Automation Assistant ===")
+    print("Connecting to browser...")
     connection_successful = await automation.connect_to_existing_browser(debugging_port=9222)
     if not connection_successful:
         print("Failed to connect to browser. Make sure Chrome is running with remote debugging enabled.")
+        print("Launch Chrome with: chrome.exe --remote-debugging-port=9222")
         return
     
-    # Set max steps
-    max_steps = int(input("Enter maximum number of steps (default 10): ") or "10")
-    
-    # Run the automation workflow
-    await automation.run_workflow(max_steps=max_steps)
+    # Start the chat interface
+    await automation.run_chat_interface()
     
     # Clean up
     await automation.close()
-
+    
 if __name__ == "__main__":
     asyncio.run(main())

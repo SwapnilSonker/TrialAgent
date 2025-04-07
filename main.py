@@ -711,6 +711,9 @@ if __name__ == "__main__":
 async def main():
     # Replace with your Anthropic API key
     api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        api_key = input("Enter your Anthropic API key: ")
+        os.environ["ANTHROPIC_API_KEY"] = api_key
     
     # Get task description from user input
     print("\n=== Web Automation for Notion and Slack ===")

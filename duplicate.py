@@ -79,21 +79,21 @@ class WebAutomation:
             self.platform = "slack"
         else:
             self.platform = "other"
-    
-    async def extract_all_potential_slack_elements(self):
-        """Extract all potential Slack UI elements without assuming specific class names"""
-        slack_elements = await self.page.evaluate("""
+            
+    async def extract_all_potential_web_elements(self):
+        """Extract all potential UI elements from any web application without assuming specific class names"""
+        web_elements = await self.page.evaluate("""
             () => {
                 const result = {
                     // Basic page structure
                     all_headers: [],
                     all_sidebars: [],
                     all_input_areas: [],
-                    all_message_containers: [],
+                    all_content_containers: [],
                     
                     // Text content 
-                    all_channel_like_items: [],
-                    all_user_names: [],
+                    all_navigation_items: [],
+                    all_user_elements: [],
                     all_status_indicators: [],
                     
                     // Interactive elements
@@ -117,28 +117,35 @@ class WebAutomation:
                         el.tagName !== 'STYLE'
                 );
                 
-                // Find potential channel/conversation items
+                // Find potential navigation/menu items
                 allTextElements.forEach(el => {
-                    // Possible channel names (typically short, contain # or start with letters)
-                    if (el.innerText.trim().length < 30 && 
-                    (el.innerText.includes('#') || /^[a-z]/i.test(el.innerText.trim()))) {
-                        result.all_channel_like_items.push({
-                            text: el.innerText.trim(),
-                            classes: el.className,
-                            id: el.id,
-                            tag: el.tagName,
-                            attrs: getDataAttributes(el)
-                        });
+                    // Possible navigation items (typically short, in menus, sidebars)
+                    if (el.innerText.trim().length < 30) {
+                        const parentIsNav = el.closest('nav, [role="navigation"], .nav, .menu, .sidebar');
+                        if (parentIsNav) {
+                            result.all_navigation_items.push({
+                                text: el.innerText.trim(),
+                                classes: el.className,
+                                id: el.id,
+                                tag: el.tagName,
+                                attrs: getDataAttributes(el)
+                            });
+                        }
                     }
                     
-                    // Look for user names (assumes they're relatively short)
-                    if (el.innerText.trim().length < 40 && !el.innerText.includes('\n')) {
-                        result.all_user_names.push({
-                            text: el.innerText.trim(),
-                            classes: el.className,
-                            id: el.id,
-                            tag: el.tagName
-                        });
+                    // Look for user-related elements (avatars, names, profiles)
+                    if (el.innerText.trim().length < 40 && !el.innerText.includes('\\n')) {
+                        const isUserElement = el.className.toLowerCase().includes('user') || 
+                                            el.id.toLowerCase().includes('user') ||
+                                            el.closest('[class*="user"], [class*="avatar"], [class*="profile"]');
+                        if (isUserElement) {
+                            result.all_user_elements.push({
+                                text: el.innerText.trim(),
+                                classes: el.className,
+                                id: el.id,
+                                tag: el.tagName
+                            });
+                        }
                     }
                 });
                 
@@ -161,8 +168,8 @@ class WebAutomation:
                     });
                 });
                 
-                // Get potential message input areas
-                document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"], div[class*="input"], div[class*="composer"]').forEach(el => {
+                // Get potential input areas
+                document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"], div[class*="input"], div[class*="editor"], div[class*="composer"]').forEach(el => {
                     result.all_input_areas.push({
                         tag: el.tagName,
                         classes: el.className,
@@ -172,9 +179,9 @@ class WebAutomation:
                     });
                 });
                 
-                // Get potential message containers
-                document.querySelectorAll('div[class*="message"], div[class*="chat"], div[class*="conversation"]').forEach(el => {
-                    result.all_message_containers.push({
+                // Get potential content containers
+                document.querySelectorAll('div[class*="content"], div[class*="main"], div[role="main"], main, article, section').forEach(el => {
+                    result.all_content_containers.push({
                         classes: el.className,
                         id: el.id,
                         children_count: el.children.length
@@ -190,19 +197,6 @@ class WebAutomation:
                         text: el.innerText.trim().substring(0, 50),
                         aria_label: el.getAttribute('aria-label') || '',
                         attrs: getDataAttributes(el)
-                    });
-                });
-                
-                // Analyze all elements with classes to find patterns
-                document.querySelectorAll('[class]').forEach(el => {
-                    const classes = el.className.split(' ');
-                    classes.forEach(cls => {
-                        if (cls) {
-                            if (!result.element_counts_by_class[cls]) {
-                                result.element_counts_by_class[cls] = 0;
-                            }
-                            result.element_counts_by_class[cls]++;
-                        }
                     });
                 });
                 
@@ -232,7 +226,7 @@ class WebAutomation:
                 return result;
             }
         """)
-        return slack_elements
+        return web_elements  
     
     async def get_page_state(self):
         """Extract current page information"""
@@ -292,6 +286,9 @@ class WebAutomation:
                     current_state['platform_specific'] = await self.extract_notion_specific_elements()
                 elif self.platform == "slack":
                     current_state['platform_specific'] = await self.extract_slack_specific_elements()
+                else :
+                    current_state['platform_specific'] = await self.extract_all_potential_web_elements()  
+                    # print(f" discord logs : {current_state['platform_specific']}")  
             except Exception as e:
                 print(f"Error extracting platform-specific elements: {str(e)}")
                 current_state['platform_specific'] = {}
@@ -628,6 +625,7 @@ class WebAutomation:
             - Fall back to XPath as alternative
             - Use text content as last resort
             - Wait for elements to be visible AND enabled before interaction
+            - Do not go far from my task that I have alloted you to do
         
         ## Critical Page Elements:
         - Popups: {json.dumps(current_state.get('popups', {}).get('popups', [])[:3], indent=2)}
@@ -666,19 +664,19 @@ class WebAutomation:
         
         # Add additional error handling to the code
         enhanced_code = self._enhance_code_with_error_handling(code)
-        
+        # print(f"current state gen : {current_state}")
         # Save the generated script with timestamp and context
         script_dir = os.path.join(self.session_dir, f"{self.session_id}_scripts")
         if not os.path.exists(script_dir):
             os.makedirs(script_dir)
         
         script_path = os.path.join(script_dir, f"step_{len(self.step_history) + 1}.py")
-        with open(script_path, 'w') as f:
+        with open(script_path, 'w', encoding="utf-8") as f:
             f.write(f"# Generated script for step {len(self.step_history) + 1}\n")
             f.write(f"# Task: {self.task_description}\n")
             f.write(f"# Platform: {self.platform}\n")
             f.write(f"# URL: {current_state['url']}\n")
-            f.write(f"# Page Title: {current_state['title']}\n")
+            f.write(f"# Page Title: {current_state.get('title', 'Untitled')}\n")
             f.write(f"# Timestamp: {datetime.datetime.now().isoformat()}\n\n")
             f.write("async def run(page):\n")
             for line in enhanced_code.split('\n'):
@@ -1000,6 +998,7 @@ class WebAutomation:
         
         # Get more detailed information about the current page
         current_state = await self.get_page_state()
+        # print(f"current state : {current_state}")
         page_elements = {
             'forms': len(current_state['forms']),
             'clickables': len(current_state['clickable_elements']),
@@ -1039,7 +1038,7 @@ class WebAutomation:
                 self.task_description = user_input[9:].strip()
                 print(f"\nAssistant: I'll help you automate: {self.task_description}")
                 print("I'm analyzing the page to determine the best course of action...")
-                
+                # print(f"current state : {current_state}")
                 # Generate the first action but don't execute yet
                 action_data = await self.get_ai_action(current_state)
                 print(f"\nAssistant: Next step - {action_data['explanation']}")

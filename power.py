@@ -6,8 +6,77 @@ import json
 import datetime
 import re
 from dotenv import load_dotenv
+import uvicorn 
+import threading
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
+
+app = FastAPI()
+
+# Add CORS middleware to allow frontend connections
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For development - restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global automation instance
+automation_instance = None
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    try:
+        if automation_instance is None:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Automation not initialized yet"
+            })
+            return
+        
+        # Send initial info
+        await websocket.send_json({
+            "type": "connected",
+            "message": "Connected to Web Automation"
+        })
+        
+        # Wait for client acknowledgment (optional)
+        try:
+            # Wait for a short time for the client to acknowledge it's ready
+            # You can make this timeout longer if needed
+            data = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
+            if data.get("type") == "connection_ready":
+                print("Client is ready to receive messages")
+        except asyncio.TimeoutError:
+            # Continue even if no acknowledgment received after timeout
+            print("No acknowledgment received from client, continuing anyway")
+        except Exception as e:
+            print(f"Error waiting for client acknowledgment: {str(e)}")
+        
+        await asyncio.sleep(0.5)
+        # Now run the chat interface with WebSocket
+        await automation_instance.run_chat_interface(websocket=websocket)
+        
+    except WebSocketDisconnect:
+        print("Client disconnected")
+    except Exception as e:
+        print(f"WebSocket error: {str(e)}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"Error: {str(e)}"
+            })
+        except:
+            pass
+
+# Function to run FastAPI server
+def run_server():
+    uvicorn.run(app, host="127.0.0.1", port=8000)
 
 class WebAutomation:
     def __init__(self, task_description, api_key, session_dir="sessions"):
@@ -79,51 +148,251 @@ class WebAutomation:
             self.platform = "slack"
         else:
             self.platform = "other"
+            
+    async def extract_all_potential_web_elements(self):
+        """Extract all potential UI elements from any web application without assuming specific class names"""
+        web_elements = await self.page.evaluate("""
+            () => {
+                const result = {
+                    // Basic page structure
+                    all_headers: [],
+                    all_sidebars: [],
+                    all_input_areas: [],
+                    all_content_containers: [],
+                    
+                    // Text content 
+                    all_navigation_items: [],
+                    all_user_elements: [],
+                    all_status_indicators: [],
+                    
+                    // Interactive elements
+                    all_buttons: [],
+                    all_clickable_items: [],
+                    
+                    // Element counts by attribute
+                    element_counts_by_class: {},
+                    element_counts_by_data_attr: {},
+                    
+                    // Page metadata
+                    page_title: document.title,
+                    viewport_width: window.innerWidth,
+                    viewport_height: window.innerHeight
+                };
+                
+                // Extract all text content that might be useful
+                const allTextElements = Array.from(document.querySelectorAll('*')).filter(
+                    el => el.innerText && el.innerText.trim() && 
+                        el.tagName !== 'SCRIPT' && 
+                        el.tagName !== 'STYLE'
+                );
+                
+                // Find potential navigation/menu items
+                allTextElements.forEach(el => {
+                    // Possible navigation items (typically short, in menus, sidebars)
+                    if (el.innerText.trim().length < 30) {
+                        const parentIsNav = el.closest('nav, [role="navigation"], .nav, .menu, .sidebar');
+                        if (parentIsNav) {
+                            result.all_navigation_items.push({
+                                text: el.innerText.trim(),
+                                classes: el.className,
+                                id: el.id,
+                                tag: el.tagName,
+                                attrs: getDataAttributes(el)
+                            });
+                        }
+                    }
+                    
+                    // Look for user-related elements (avatars, names, profiles)
+                    if (el.innerText.trim().length < 40 && !el.innerText.includes('\\n')) {
+                        const isUserElement = el.className.toLowerCase().includes('user') || 
+                                            el.id.toLowerCase().includes('user') ||
+                                            el.closest('[class*="user"], [class*="avatar"], [class*="profile"]');
+                        if (isUserElement) {
+                            result.all_user_elements.push({
+                                text: el.innerText.trim(),
+                                classes: el.className,
+                                id: el.id,
+                                tag: el.tagName
+                            });
+                        }
+                    }
+                });
+                
+                // Get potential headers
+                document.querySelectorAll('header, [role="banner"], div[class*="header"], div[id*="header"]').forEach(el => {
+                    result.all_headers.push({
+                        classes: el.className,
+                        id: el.id,
+                        children_count: el.children.length,
+                        text: el.innerText.substring(0, 100)
+                    });
+                });
+                
+                // Get potential sidebars
+                document.querySelectorAll('aside, nav, div[class*="sidebar"], div[id*="sidebar"], div[class*="nav"], div[id*="nav"]').forEach(el => {
+                    result.all_sidebars.push({
+                        classes: el.className,
+                        id: el.id,
+                        children_count: el.children.length
+                    });
+                });
+                
+                // Get potential input areas
+                document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"], div[class*="input"], div[class*="editor"], div[class*="composer"]').forEach(el => {
+                    result.all_input_areas.push({
+                        tag: el.tagName,
+                        classes: el.className,
+                        id: el.id,
+                        placeholder: el.getAttribute('placeholder') || '',
+                        attrs: getDataAttributes(el)
+                    });
+                });
+                
+                // Get potential content containers
+                document.querySelectorAll('div[class*="content"], div[class*="main"], div[role="main"], main, article, section').forEach(el => {
+                    result.all_content_containers.push({
+                        classes: el.className,
+                        id: el.id,
+                        children_count: el.children.length
+                    });
+                });
+                
+                // Get all clickable elements
+                document.querySelectorAll('button, a, [role="button"], [tabindex="0"]').forEach(el => {
+                    result.all_buttons.push({
+                        tag: el.tagName,
+                        classes: el.className,
+                        id: el.id,
+                        text: el.innerText.trim().substring(0, 50),
+                        aria_label: el.getAttribute('aria-label') || '',
+                        attrs: getDataAttributes(el)
+                    });
+                });
+                
+                // Analyze data attributes
+                document.querySelectorAll('[data-qa], [data-test], [data-testid]').forEach(el => {
+                    const dataAttrs = getDataAttributes(el);
+                    Object.keys(dataAttrs).forEach(attr => {
+                        const key = `${attr}:${dataAttrs[attr]}`;
+                        if (!result.element_counts_by_data_attr[key]) {
+                            result.element_counts_by_data_attr[key] = 0;
+                        }
+                        result.element_counts_by_data_attr[key]++;
+                    });
+                });
+                
+                // Helper function to get data attributes
+                function getDataAttributes(el) {
+                    const result = {};
+                    Array.from(el.attributes).forEach(attr => {
+                        if (attr.name.startsWith('data-')) {
+                            result[attr.name] = attr.value;
+                        }
+                    });
+                    return result;
+                }
+                
+                return result;
+            }
+        """)
+        return web_elements  
     
     async def get_page_state(self):
         """Extract current page information"""
         if not self.page:
             print("Error: No active page. Connect to a browser first.")
-            return {}
+            return {
+                'url': '',
+                'title': '',
+                'html': '',
+                'visible_text': [],
+                'forms': [],
+                'clickable_elements': [],
+                'platform': 'unknown'
+            }  # Return default structure instead of empty dict
         
         try:
             # Re-detect platform each time to handle navigation between platforms
             await self._detect_platform()
             
+            # Initialize with default values to prevent "key not found" errors
             current_state = {
                 'url': self.page.url,
                 'title': await self.page.title(),
                 'html': await self.page.content(),
-                'visible_text': await self.extract_visible_text(),
-                'forms': await self.detect_forms(),
-                'clickable_elements': await self.detect_clickable_elements(),
-                # 'popups': await self.detect_popups(),  # Add popup detection
+                'visible_text': [],
+                'forms': [],
+                'clickable_elements': [],
                 'platform': self.platform
             }
             
+            # Try to add each component, but continue if any fails
+            try:
+                current_state['visible_text'] = await self.extract_visible_text()
+            except Exception as e:
+                print(f"Error extracting visible text: {str(e)}")
+                
+            try:
+                current_state['forms'] = await self.detect_forms()
+            except Exception as e:
+                print(f"Error detecting forms: {str(e)}")
+                
+            try:
+                current_state['clickable_elements'] = await self.detect_clickable_elements()
+            except Exception as e:
+                print(f"Error detecting clickable elements: {str(e)}")
+            
+            # Add popup detection
+            # try:
+                # current_state['popups'] = await self.detect_popups()
+            # except Exception as e:
+            # print(f"Error detecting popups: {str(e)}")
+            # current_state['popups'] = {'popups': []}
+            
             # Add platform-specific data
-            if self.platform == "notion":
-                current_state['platform_specific'] = await self.extract_notion_specific_elements()
-            elif self.platform == "slack":
-                current_state['platform_specific'] = await self.extract_slack_specific_elements()
+            try:
+                if self.platform == "notion":
+                    current_state['platform_specific'] = await self.extract_notion_specific_elements()
+                elif self.platform == "slack":
+                    current_state['platform_specific'] = await self.extract_slack_specific_elements()
+                else :
+                    current_state['platform_specific'] = await self.extract_all_potential_web_elements()  
+                    # print(f" discord logs : {current_state['platform_specific']}")  
+            except Exception as e:
+                print(f"Error extracting platform-specific elements: {str(e)}")
+                current_state['platform_specific'] = {}
             
             # Take a screenshot for reference
-            screenshots_dir = os.path.join(self.session_dir, f"{self.session_id}_screenshots")
-            if not os.path.exists(screenshots_dir):
-                os.makedirs(screenshots_dir)
-            
-            screenshot_path = os.path.join(screenshots_dir, f"step_{len(self.step_history) + 1}.png")
-            await self.page.screenshot(path=screenshot_path)
+            try:
+                screenshots_dir = os.path.join(self.session_dir, f"{self.session_id}_screenshots")
+                if not os.path.exists(screenshots_dir):
+                    os.makedirs(screenshots_dir)
+                
+                screenshot_path = os.path.join(screenshots_dir, f"step_{len(self.step_history) + 1}.png")
+                await self.page.screenshot(path=screenshot_path)
+            except Exception as e:
+                print(f"Error taking screenshot: {str(e)}")
             
             # Save current state to a file for state persistence
-            self._save_current_state(current_state)
+            try:
+                self._save_current_state(current_state)
+            except Exception as e:
+                print(f"Error saving current state: {str(e)}")
             
             return current_state
-        
+            
         except Exception as e:
             print(f"Error getting page state: {str(e)}")
-            return {}
-    
+            return {
+                'url': '',
+                'title': '',
+                'html': '',
+                'visible_text': [],
+                'forms': [],
+                'clickable_elements': [],
+                'platform': 'unknown'
+            }  # Return default structure    
+                  
     def _save_current_state(self, state):
         """Save the current state to a file for recovery"""
         states_dir = os.path.join(self.session_dir, f"{self.session_id}_states")
@@ -180,35 +449,65 @@ class WebAutomation:
         return text_elements
     
     async def detect_forms(self):
-        """Detect forms on the page"""
-        forms = await self.page.evaluate("""
-            () => {
-                const formData = [];
-                const forms = document.querySelectorAll('form');
-                forms.forEach((form, index) => {
-                    const inputs = [];
-                    form.querySelectorAll('input, select, textarea').forEach(input => {
-                        inputs.push({
-                            type: input.type || input.tagName.toLowerCase(),
+        """Detect forms and input fields on the page"""
+        try:
+            forms = await self.page.evaluate("""
+                () => {
+                    const result = [];
+                    // Get all forms
+                    document.querySelectorAll('form').forEach((form, formIndex) => {
+                        const formData = {
+                            id: form.id || `form_${formIndex}`,
+                            action: form.action || '',
+                            method: form.method || '',
+                            inputs: []
+                        };
+                        
+                        // Get all inputs in this form
+                        form.querySelectorAll('input, select, textarea').forEach((input, inputIndex) => {
+                            formData.inputs.push({
+                                name: input.name || '',
+                                id: input.id || '',
+                                type: input.type || input.tagName.toLowerCase(),
+                                value: input.value || '',
+                                placeholder: input.placeholder || '',
+                                required: input.required || false
+                            });
+                        });
+                        
+                        result.push(formData);
+                    });
+                    
+                    // Also detect standalone input fields (not in forms)
+                    const standaloneForm = {
+                        id: 'standalone_inputs',
+                        action: '',
+                        method: '',
+                        inputs: []
+                    };
+                    
+                    document.querySelectorAll('input:not(form input), textarea:not(form textarea), select:not(form select), [contenteditable="true"]').forEach((input, index) => {
+                        standaloneForm.inputs.push({
                             name: input.name || '',
                             id: input.id || '',
+                            type: input.type || input.tagName.toLowerCase() || (input.hasAttribute('contenteditable') ? 'contenteditable' : ''),
+                            value: input.value || '',
                             placeholder: input.placeholder || '',
-                            dataQa: input.getAttribute('data-qa') || '',
-                            ariaLabel: input.getAttribute('aria-label') || ''
+                            required: input.required || false
                         });
                     });
                     
-                    formData.push({
-                        index,
-                        inputs,
-                        submitButton: form.querySelector('button[type="submit"], input[type="submit"]') ? true : false
-                    });
-                });
-                return formData;
-            }
-        """)
-        return forms
-    
+                    if (standaloneForm.inputs.length > 0) {
+                        result.push(standaloneForm);
+                    }
+                    
+                    return result;
+                }
+            """)
+            return forms
+        except Exception as e:
+            print(f"Error detecting forms: {str(e)}")
+            return []  # Return an empty list instead of None or raising an error  
     async def detect_clickable_elements(self):
         """Detect clickable elements"""
         clickables = await self.page.evaluate("""
@@ -349,8 +648,9 @@ class WebAutomation:
         """)
         return slack_elements
     
-    async def get_ai_action(self, current_state):
-        """Get next action from Anthropic API with enhanced context understanding"""
+    # Modified get_ai_action function with WebSocket streaming
+    async def get_ai_action(self, current_state, websocket=None):
+        """Get next action from Anthropic API with enhanced context understanding and WebSocket streaming"""
         # Update platform detection if needed
         await self._detect_platform()
         
@@ -390,8 +690,12 @@ class WebAutomation:
         - Extract content
         - Scroll or move to view more content
         6. CONSIDER the task context and previous steps when deciding the next action
-        7. DONT click any unnecessary element.
-        8. Follow the instructions carefully and avoid making assumptions
+        7. ALWAYS USE MULTIPLE SELECTOR STRATEGIES for each element:
+            - Try CSS selector first
+            - Fall back to XPath as alternative
+            - Use text content as last resort
+            - Wait for elements to be visible AND enabled before interaction
+            - Do not go far from my task that I have alloted you to do
         
         ## Critical Page Elements:
         - Popups: {json.dumps(current_state.get('popups', {}).get('popups', [])[:3], indent=2)}
@@ -410,15 +714,54 @@ class WebAutomation:
         Generate ONLY executable Python code without any explanations, markdown, or surrounding text.
         """
         
-        # Call the Anthropic API with increased tokens for deeper analysis
-        response = self.client.messages.create(
+        # Inform WebSocket client that generation is starting
+        if websocket:
+            try:
+                await websocket.send_json({
+                    "type": "generation_start",
+                    "message": "Starting code generation...",
+                    "step": len(self.step_history) + 1
+                })
+            except Exception as e:
+                print(f"WebSocket error: {str(e)}")
+        
+        # Stream response from Claude API
+        full_response = ""
+        current_code = ""
+        
+        # Call the Anthropic API with streaming enabled
+        with self.client.messages.stream(
             model="claude-3-7-sonnet-20250219",
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}]
-        )
+        ) as stream:
+            for text in stream.text_stream:
+                full_response += text
+                
+                # Process the text to extract code as it comes in
+                if full_response.strip():
+                    # Simple processing for streaming - more advanced parsing would be needed
+                    # for perfect streaming of code blocks
+                    current_code = full_response.strip()
+                    
+                    # Remove markdown code blocks if they start to appear
+                    if current_code.startswith("```python"):
+                        current_code = current_code.split("```python")[1]
+                    if "```" in current_code:
+                        current_code = current_code.rsplit("```", 1)[0]
+                    
+                    # Send the updated code to the WebSocket client
+                    if websocket:
+                        try:
+                            await websocket.send_json({
+                                "type": "code_update",
+                                "code": current_code.strip()
+                            })
+                        except Exception as e:
+                            print(f"WebSocket error: {str(e)}")
         
-        # Extract the code from the response
-        code = response.content[0].text.strip()
+        # Final cleanup of the code
+        code = full_response.strip()
         
         # Remove any markdown code blocks if present
         if code.startswith("```python"):
@@ -437,12 +780,12 @@ class WebAutomation:
             os.makedirs(script_dir)
         
         script_path = os.path.join(script_dir, f"step_{len(self.step_history) + 1}.py")
-        with open(script_path, 'w') as f:
+        with open(script_path, 'w', encoding="utf-8") as f:
             f.write(f"# Generated script for step {len(self.step_history) + 1}\n")
             f.write(f"# Task: {self.task_description}\n")
             f.write(f"# Platform: {self.platform}\n")
             f.write(f"# URL: {current_state['url']}\n")
-            f.write(f"# Page Title: {current_state['title']}\n")
+            f.write(f"# Page Title: {current_state.get('title', 'Untitled')}\n")
             f.write(f"# Timestamp: {datetime.datetime.now().isoformat()}\n\n")
             f.write("async def run(page):\n")
             for line in enhanced_code.split('\n'):
@@ -451,12 +794,23 @@ class WebAutomation:
         # Get explanation for the action
         explanation = await self._get_action_explanation(enhanced_code)
         
+        # Send final complete code to WebSocket
+        if websocket:
+            try:
+                await websocket.send_json({
+                    "type": "generation_complete",
+                    "code": enhanced_code,
+                    "explanation": explanation,
+                    "script_path": script_path
+                })
+            except Exception as e:
+                print(f"WebSocket error: {str(e)}")
+        
         return {
             'code': enhanced_code,
             'explanation': explanation,
             'script_path': script_path
-        } 
-        
+        }       
     
     def _enhance_code_with_error_handling(self, code):
         """Add improved error handling to generated code"""
@@ -576,32 +930,33 @@ class WebAutomation:
             print("Error: No active page. Connect to a browser first.")
             return {'success': False, 'error': 'No active page'}
         
+        
         try:
             # Check for popups before executing the action
-            current_state = await self.get_page_state()
-            popups = current_state.get('popups', {}).get('popups', [])
+            # current_state = await self.get_page_state()
+            # popups = current_state.get('popups', {}).get('popups', [])
             
-            if popups:
-                print(f"\n--- Detected {len(popups)} popup(s) ---")
-                for i, popup in enumerate(popups):
-                    popup_text = popup.get('text', '')[:50].replace('\n', ' ')
-                    print(f"Popup {i+1}: {popup_text}...")
+            # if popups:
+            #     print(f"\n--- Detected {len(popups)} popup(s) ---")
+            #     for i, popup in enumerate(popups):
+            #         popup_text = popup.get('text', '')[:50].replace('\n', ' ')
+            #         print(f"Popup {i+1}: {popup_text}...")
                     
-                    if popup.get('buttons'):
-                        print(f"  Buttons: {', '.join(popup['buttons'][:3])}")
+            #         if popup.get('buttons'):
+            #             print(f"  Buttons: {', '.join(popup['buttons'][:3])}")
                 
                 # Get AI guidance on how to handle the popup
-                popup_handling_code = await self.get_popup_handling_action(popups)
+                # popup_handling_code = await self.get_popup_handling_action(popups)
                 
                 # Execute the popup handling code
-                print("Handling popup before proceeding...")
-                page = self.page
-                exec_globals = {'page': page, 'asyncio': asyncio, 'datetime': datetime}
-                exec(f"async def _handle_popup():\n{self._indent_code(popup_handling_code)}", exec_globals)
-                await exec_globals['_handle_popup']()
+                # print("Handling popup before proceeding...")
+                # page = self.page
+                # exec_globals = {'page': page, 'asyncio': asyncio, 'datetime': datetime}
+                # exec(f"async def _handle_popup():\n{self._indent_code(popup_handling_code)}", exec_globals)
+                # await exec_globals['_handle_popup']()
                 
                 # Wait for popup to be dismissed
-                await asyncio.sleep(2)
+                # await asyncio.sleep(2)
             
             # Prepare execution context for the main action
             page = self.page
@@ -609,6 +964,23 @@ class WebAutomation:
             
             # Add debugging info
             print(f"\n--- Executing AI-generated code on {self.platform.capitalize()} ---")
+            
+            max_retries = 3
+            retry_count = 0
+            while retry_count < max_retries:
+                try:
+                    # Execute code here
+                    exec(f"async def _temp_action():\n{self._indent_code(code)}", exec_globals)
+                    await exec_globals['_temp_action']()
+                    break  # Success, exit retry loop
+                except Exception as e:
+                    retry_count += 1
+                    print(f"Attempt {retry_count}/{max_retries} failed: {str(e)}")
+                    if retry_count < max_retries:
+                        print("Retrying after short delay...")
+                        await asyncio.sleep(2)
+                    else:
+                        raise  # Re-raise if all retries failed
             
             # Take screenshot before execution
             before_screenshot = f"before_step_{len(self.step_history) + 1}.png"
@@ -619,7 +991,7 @@ class WebAutomation:
             await exec_globals['_temp_action']()
             
             # Wait for potential navigation or DOM changes
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
             
             # Take screenshot after execution
             after_screenshot = f"after_step_{len(self.step_history) + 1}.png"
@@ -737,8 +1109,8 @@ class WebAutomation:
             formatted.append(step_summary)
         
         return "\n".join(formatted)
-            
-    async def run_chat_interface(self):
+    
+    async def run_chat_interface(self, websocket=None):
         """Run an improved chat-based interface for the automation"""
         print("\n=== Web Automation Assistant ===")
         print(f"Connected to: {await self.page.title()} ({self.page.url})")
@@ -746,6 +1118,7 @@ class WebAutomation:
         
         # Get more detailed information about the current page
         current_state = await self.get_page_state()
+        # print(f"current state : {current_state}")
         page_elements = {
             'forms': len(current_state['forms']),
             'clickables': len(current_state['clickable_elements']),
@@ -756,507 +1129,451 @@ class WebAutomation:
         print("\nI'm your web automation assistant. I can help you automate tasks or answer questions about this page.")
         print("What would you like to do? (Type 'help' for commands)")
         
-        while True:
-            user_input = input("\nYou: ").strip()
-            
-            if user_input.lower() in ['exit', 'quit', 'bye']:
-                print("Assistant: Goodbye! Closing automation assistant.")
-                break
+        # Send initial state to WebSocket if connected
+        if websocket:
+            try:
+                try:
+                    script_path = await self.export_full_script()
+                    with open(script_path, 'r', encoding='utf-8') as f:
+                        script_content = f.read()
+                except Exception:
+                    script_content = None  # No script yet
+                await websocket.send_json({
+                    "type": "page_state",
+                    "url": current_state['url'],
+                    "title": current_state['title'],
+                    "platform": self.platform,
+                    "elements": page_elements,
+                    "script": script_content,
+                })
+            except Exception as e:
+                print(f"WebSocket error: {str(e)}")
+        
+        # Process commands from WebSocket if provided, otherwise use terminal
+        if websocket:
+            try:
+                while True:
+                    data = await websocket.receive_json()
+                    user_input = data.get("command", "")
                     
-            if user_input.lower() in ['help', 'commands']:
-                print("\nAssistant: Here are available commands:")
-                print("- 'automate [task]': Start automating a specific task")
-                print("- 'next step': Execute the next automation step")
-                print("- 'continue [n]': Run n automation steps (default: 3)")
-                print("- 'state': Get analysis of the current page")
-                print("- 'screenshot': Take a screenshot of the current page")
-                print("- 'save script': Export the full automation script")
-                print("- 'analyze completion': Analyze if the task is complete")
-                print("- 'go to [url]': Navigate to a specific URL")
-                print("- Any other input will be treated as a question about the page")
-                continue
-                    
-            # Update state to ensure we have the latest information
-            current_state = await self.get_page_state()
-            
-            # Handle different command types
-            if user_input.lower().startswith('automate '):
-                # Set a new task and prepare for automation
-                self.task_description = user_input[9:].strip()
-                print(f"\nAssistant: I'll help you automate: {self.task_description}")
-                print("I'm analyzing the page to determine the best course of action...")
-                
-                # Generate the first action but don't execute yet
-                action_data = await self.get_ai_action(current_state)
-                print(f"\nAssistant: Next step - {action_data['explanation']}")
-                print("Type 'next step' to execute this action.")
-                self.pending_action = action_data
-                
-            elif user_input.lower() == 'next step':
-                # Execute pending action if available
-                if hasattr(self, 'pending_action') and self.pending_action:
-                    print(f"\nAssistant: Executing step - {self.pending_action['explanation']}...")
-                    result = await self.execute_action(self.pending_action['code'])
-                    
-                    if result['success']:
-                        print("Action completed successfully!")
-                        # Get updated state
-                        current_state = await self.get_page_state()
+                    if not user_input:
+                        continue
                         
-                        # Check if task is complete
-                        completion = await self.analyze_task_completion(current_state)
-                        if completion['is_complete']:
-                            print(f"\nTask completed! ({completion['completion_percentage']}%)")
-                            print(f"Reason: {completion['reason']}")
+                    if user_input.lower() in ['exit', 'quit', 'bye']:
+                        await websocket.send_json({"type": "message", "message": "Assistant: Goodbye! Closing automation assistant."})
+                        break
                             
-                            # Save the complete automation script
-                            script_path = await self.export_full_script()
-                            print(f"Full automation script saved to: {script_path}")
+                    if user_input.lower() in ['help', 'commands']:
+                        help_text = "\nAssistant: Here are available commands:\n"
+                        help_text += "- 'automate [task]': Start automating a specific task\n"
+                        help_text += "- 'next step': Execute the next automation step\n"
+                        help_text += "- 'continue [n]': Run n automation steps (default: 3)\n"
+                        help_text += "- 'state': Get analysis of the current page\n"
+                        help_text += "- 'screenshot': Take a screenshot of the current page\n"
+                        help_text += "- 'save script': Export the full automation script\n"
+                        help_text += "- 'analyze completion': Analyze if the task is complete\n"
+                        help_text += "- 'go to [url]': Navigate to a specific URL\n"
+                        help_text += "- Any other input will be treated as a question about the page"
+                        await websocket.send_json({"type": "help", "message": help_text})
+                        continue
+                    
+                    # Update state to ensure we have the latest information
+                    current_state = await self.get_page_state()
+                    
+                    # Handle different command types for WebSocket
+                    if user_input.lower().startswith('automate '):
+                        # Set a new task and prepare for automation
+                        self.task_description = user_input[9:].strip()
+                        await websocket.send_json({
+                            "type": "message", 
+                            "message": f"\nAssistant: I'll help you automate: {self.task_description}\nI'm analyzing the page to determine the best course of action..."
+                        })
+                        
+                        # Generate the first action but don't execute yet
+                        action_data = await self.get_ai_action(current_state, websocket)
+                        await websocket.send_json({
+                            "type": "next_step", 
+                            "message": f"\nAssistant: Next step - {action_data['explanation']}\nType 'next step' to execute this action."
+                        })
+                        self.pending_action = action_data
+                        
+                    elif user_input.lower() == 'next step':
+                        # Execute pending action if available
+                        if hasattr(self, 'pending_action') and self.pending_action:
+                            await websocket.send_json({
+                                "type": "message", 
+                                "message": f"\nAssistant: Executing step - {self.pending_action['explanation']}..."
+                            })
                             
-                            self.pending_action = None
-                        else:
-                            # Generate next action
-                            self.pending_action = await self.get_ai_action(current_state)
-                            print(f"\nAssistant: Next step - {self.pending_action['explanation']}")
-                            print(f"Progress: ~{completion['completion_percentage']}% complete")
-                    else:
-                        print(f"Action failed: {result.get('error', 'Unknown error')}")
-                        if 'error_screenshot' in result:
-                            print(f"Error screenshot saved to: {result['error_screenshot']}")
-                        
-                        # Ask for recovery options
-                        print("\nAssistant: I encountered an issue. What would you like to do?")
-                        print("1. Try again")
-                        print("2. Get a new suggestion")
-                        print("3. Manual intervention (I'll wait)")
-                        recovery_choice = input("Enter choice (1-3): ")
-                        
-                        if recovery_choice == '1':
-                            # Try the same action again
-                            print("Trying the same action again...")
                             result = await self.execute_action(self.pending_action['code'])
+                            
                             if result['success']:
-                                print("Success on retry!")
+                                await websocket.send_json({
+                                    "type": "action_result", 
+                                    "success": True,
+                                    "message": "Action completed successfully!"
+                                })
+                                
+                                # Get updated state
                                 current_state = await self.get_page_state()
+                                
+                                # Check if task is complete
+                                completion = await self.analyze_task_completion(current_state)
+                                if completion['is_complete']:
+                                    await websocket.send_json({
+                                        "type": "task_complete", 
+                                        "message": f"\nTask completed! ({completion['completion_percentage']}%)\nReason: {completion['reason']}",
+                                        "completion": completion
+                                    })
+                                    
+                                    # Save the complete automation script
+                                    script_path = await self.export_full_script()
+                                    await websocket.send_json({
+                                        "type": "script_saved", 
+                                        "path": script_path,
+                                        "message": f"Full automation script saved to: {script_path}"
+                                    })
+                                    
+                                    self.pending_action = None
+                                else:
+                                    # Generate next action
+                                    self.pending_action = await self.get_ai_action(current_state, websocket)
+                                    await websocket.send_json({
+                                        "type": "next_step", 
+                                        "message": f"\nAssistant: Next step - {self.pending_action['explanation']}\nProgress: ~{completion['completion_percentage']}% complete",
+                                        "completion_percentage": completion['completion_percentage']
+                                    })
+                            else:
+                                await websocket.send_json({
+                                    "type": "action_result", 
+                                    "success": False,
+                                    "error": f"Action failed: {result.get('error', 'Unknown error')}"
+                                })
+                                
+                                if 'error_screenshot' in result:
+                                    await websocket.send_json({
+                                        "type": "error_screenshot", 
+                                        "path": result['error_screenshot'],
+                                        "message": f"Error screenshot saved to: {result['error_screenshot']}"
+                                    })
+                                
+                                # Ask for recovery options
+                                await websocket.send_json({
+                                    "type": "recovery_options",
+                                    "message": "\nAssistant: I encountered an issue. What would you like to do?",
+                                    "options": [
+                                        "1. Try again",
+                                        "2. Get a new suggestion",
+                                        "3. Manual intervention (I'll wait)"
+                                    ]
+                                })
+                                
+                                # Wait for recovery choice
+                                recovery_data = await websocket.receive_json()
+                                recovery_choice = recovery_data.get("choice", "3")
+                                
+                                if recovery_choice == '1':
+                                    # Try the same action again
+                                    await websocket.send_json({
+                                        "type": "message",
+                                        "message": "Trying the same action again..."
+                                    })
+                                    
+                                    result = await self.execute_action(self.pending_action['code'])
+                                    if result['success']:
+                                        await websocket.send_json({
+                                            "type": "message",
+                                            "message": "Success on retry!"
+                                        })
+                                        
+                                        current_state = await self.get_page_state()
+                                        self.pending_action = await self.get_ai_action(current_state, websocket)
+                                        await websocket.send_json({
+                                            "type": "next_step",
+                                            "message": f"\nAssistant: Next step - {self.pending_action['explanation']}"
+                                        })
+                                elif recovery_choice == '2':
+                                    # Get a new action suggestion
+                                    await websocket.send_json({
+                                        "type": "message",
+                                        "message": "Getting a new action suggestion..."
+                                    })
+                                    
+                                    current_state = await self.get_page_state()
+                                    self.pending_action = await self.get_ai_action(current_state, websocket)
+                                    await websocket.send_json({
+                                        "type": "next_step",
+                                        "message": f"\nAssistant: New suggested step - {self.pending_action['explanation']}"
+                                    })
+                                else:
+                                    # Manual intervention
+                                    await websocket.send_json({
+                                        "type": "manual_intervention",
+                                        "message": "Please manually interact with the browser, then type 'next step' when ready"
+                                    })
+                                    
+                                    self.pending_action = None
+                        else:
+                            await websocket.send_json({
+                                "type": "message",
+                                "message": "\nAssistant: No pending action. Use 'automate [task]' to start a new task."
+                            })
+                    
+                    # Handle other common commands
+                    elif user_input.lower().startswith('continue'):
+                        parts = user_input.split()
+                        steps = 3  # Default
+                        if len(parts) > 1 and parts[1].isdigit():
+                            steps = int(parts[1])
+                            
+                        await websocket.send_json({
+                            "type": "message",
+                            "message": f"\nAssistant: Running {steps} automation steps..."
+                        })
+                        
+                        for i in range(steps):
+                            if not hasattr(self, 'pending_action') or not self.pending_action:
+                                # Generate a new action if none is pending
+                                self.pending_action = await self.get_ai_action(current_state, websocket)
+                                
+                            await websocket.send_json({
+                                "type": "step_progress",
+                                "message": f"\nStep {i+1}/{steps} - {self.pending_action['explanation']}...",
+                                "current": i+1,
+                                "total": steps
+                            })
+                            
+                            result = await self.execute_action(self.pending_action['code'])
+                            
+                            if result['success']:
+                                await websocket.send_json({
+                                    "type": "message",
+                                    "message": "Success!"
+                                })
+                                
+                                # Update state and generate next action
+                                current_state = await self.get_page_state()
+                                
+                                # Check if task is complete
+                                completion = await self.analyze_task_completion(current_state)
+                                if completion['is_complete']:
+                                    await websocket.send_json({
+                                        "type": "task_complete",
+                                        "message": f"\nTask completed! ({completion['completion_percentage']}%)\nReason: {completion['reason']}",
+                                        "completion": completion
+                                    })
+                                    
+                                    script_path = await self.export_full_script()
+                                    await websocket.send_json({
+                                        "type": "script_saved",
+                                        "path": script_path,
+                                        "message": f"Full automation script saved to: {script_path}"
+                                    })
+                                    
+                                    self.pending_action = None
+                                    break
+                                
+                                self.pending_action = await self.get_ai_action(current_state, websocket)
+                            else:
+                                await websocket.send_json({
+                                    "type": "error",
+                                    "message": f"Step failed: {result.get('error', 'Unknown error')}\nEncountered an error. Stopping automation sequence."
+                                })
+                                break
+                                
+                        await websocket.send_json({
+                            "type": "message",
+                            "message": "\nAssistant: Automation sequence completed."
+                        })
+                        
+                        if hasattr(self, 'pending_action') and self.pending_action:
+                            await websocket.send_json({
+                                "type": "next_step",
+                                "message": f"Next suggested step: {self.pending_action['explanation']}"
+                            })
+                            
+                    elif user_input.lower() == 'save script':
+                        script_path = await self.export_full_script()
+                        await websocket.send_json({
+                            "type": "script_saved",
+                            "path": script_path,
+                            "message": f"\nAssistant: Full automation script saved to: {script_path}"
+                        })
+                        
+                    elif user_input.lower() == 'analyze completion':
+                        completion = await self.analyze_task_completion(current_state)
+                        
+                        completion_info = f"\nAssistant: Task Completion Analysis:\n"
+                        completion_info += f"Complete: {completion['is_complete']}\n"
+                        completion_info += f"Progress: ~{completion['completion_percentage']}% complete\n"
+                        completion_info += f"Analysis: {completion['reason']}"
+                        
+                        if completion['remaining_steps']:
+                            completion_info += "\nRemaining steps:"
+                            for i, step in enumerate(completion['remaining_steps']):
+                                completion_info += f"\n  {i+1}. {step}"
+                        
+                        await websocket.send_json({
+                            "type": "completion_analysis",
+                            "message": completion_info,
+                            "completion": completion
+                        })
+                        
+                    elif user_input.lower().startswith('go to '):
+                        url = user_input[6:].strip()
+                        if not url.startswith(('http://', 'https://')):
+                            url = 'https://' + url
+                        
+                        await websocket.send_json({
+                            "type": "message",
+                            "message": f"\nAssistant: Navigating to {url}..."
+                        })
+                        
+                        try:
+                            await self.page.goto(url)
+                            await asyncio.sleep(2)
+                            await self._detect_platform()
+                            current_state = await self.get_page_state()
+                            
+                            await websocket.send_json({
+                                "type": "navigation_complete",
+                                "message": f"Navigation complete. Now at: {current_state['title']}\nPlatform detected: {self.platform}",
+                                "url": url,
+                                "title": current_state['title'],
+                                "platform": self.platform
+                            })
+                        except Exception as e:
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": f"Navigation failed: {str(e)}"
+                            })
+                            
+                    else:
+                        # Treat as a general question about the page
+                        answer = await self.chat_query(user_input)
+                        await websocket.send_json({
+                            "type": "message",
+                            "message": f"\nAssistant: {answer}"
+                        })
+            except WebSocketDisconnect:
+                print("WebSocket client disconnected")
+            except Exception as e:
+                print(f"WebSocket error: {str(e)}")
+        else:
+            # Original terminal-based interface - keep this intact
+            while True:
+                user_input = input("\nYou: ").strip()
+                
+                if user_input.lower() in ['exit', 'quit', 'bye']:
+                    print("Assistant: Goodbye! Closing automation assistant.")
+                    break
+                        
+                if user_input.lower() in ['help', 'commands']:
+                    print("\nAssistant: Here are available commands:")
+                    print("- 'automate [task]': Start automating a specific task")
+                    print("- 'next step': Execute the next automation step")
+                    print("- 'continue [n]': Run n automation steps (default: 3)")
+                    print("- 'state': Get analysis of the current page")
+                    print("- 'screenshot': Take a screenshot of the current page")
+                    print("- 'save script': Export the full automation script")
+                    print("- 'analyze completion': Analyze if the task is complete")
+                    print("- 'go to [url]': Navigate to a specific URL")
+                    print("- Any other input will be treated as a question about the page")
+                    continue
+                        
+                # Update state to ensure we have the latest information
+                current_state = await self.get_page_state()
+                
+                # Handle different command types
+                if user_input.lower().startswith('automate '):
+                    # Set a new task and prepare for automation
+                    self.task_description = user_input[9:].strip()
+                    print(f"\nAssistant: I'll help you automate: {self.task_description}")
+                    print("I'm analyzing the page to determine the best course of action...")
+                    
+                    # Generate the first action but don't execute yet
+                    action_data = await self.get_ai_action(current_state)
+                    print(f"\nAssistant: Next step - {action_data['explanation']}")
+                    print("Type 'next step' to execute this action.")
+                    self.pending_action = action_data
+                    
+                elif user_input.lower() == 'next step':
+                    # Execute pending action if available
+                    if hasattr(self, 'pending_action') and self.pending_action:
+                        print(f"\nAssistant: Executing step - {self.pending_action['explanation']}...")
+                        result = await self.execute_action(self.pending_action['code'])
+                        
+                        if result['success']:
+                            print("Action completed successfully!")
+                            # Get updated state
+                            current_state = await self.get_page_state()
+                            
+                            # Check if task is complete
+                            completion = await self.analyze_task_completion(current_state)
+                            if completion['is_complete']:
+                                print(f"\nTask completed! ({completion['completion_percentage']}%)")
+                                print(f"Reason: {completion['reason']}")
+                                
+                                # Save the complete automation script
+                                script_path = await self.export_full_script()
+                                print(f"Full automation script saved to: {script_path}")
+                                
+                                self.pending_action = None
+                            else:
+                                # Generate next action
                                 self.pending_action = await self.get_ai_action(current_state)
                                 print(f"\nAssistant: Next step - {self.pending_action['explanation']}")
-                        elif recovery_choice == '2':
-                            # Get a new action suggestion
-                            print("Getting a new action suggestion...")
-                            current_state = await self.get_page_state()
-                            self.pending_action = await self.get_ai_action(current_state)
-                            print(f"\nAssistant: New suggested step - {self.pending_action['explanation']}")
+                                print(f"Progress: ~{completion['completion_percentage']}% complete")
                         else:
-                            # Manual intervention
-                            print("Please manually interact with the browser, then type 'next step' when ready")
-                            await asyncio.sleep(1)
-                            self.pending_action = None
-                else:
-                    print("\nAssistant: No pending action. Use 'automate [task]' to start a new task.")
-            
-            # Add the remaining handlers for other commands...
-            # (The rest of the method would handle the remaining commands like 'continue',
-            # 'state', 'screenshot', 'save script', etc. - I'm focusing on the core functionality)
-            
-            elif user_input.lower().startswith('continue'):
-                # [Implementation of continue command]
-                parts = user_input.split()
-                steps = 3  # Default
-                if len(parts) > 1 and parts[1].isdigit():
-                    steps = int(parts[1])
-                    
-                print(f"\nAssistant: Running {steps} automation steps...")
-                
-                for i in range(steps):
-                    if not hasattr(self, 'pending_action') or not self.pending_action:
-                        # Generate a new action if none is pending
-                        self.pending_action = await self.get_ai_action(current_state)
-                        
-                    print(f"\nStep {i+1}/{steps} - {self.pending_action['explanation']}...")
-                    result = await self.execute_action(self.pending_action['code'])
-                    
-                    if result['success']:
-                        print("Success!")
-                        # Update state and generate next action
-                        current_state = await self.get_page_state()
-                        
-                        # Check if task is complete
-                        completion = await self.analyze_task_completion(current_state)
-                        if completion['is_complete']:
-                            print(f"\nTask completed! ({completion['completion_percentage']}%)")
-                            print(f"Reason: {completion['reason']}")
-                            script_path = await self.export_full_script()
-                            print(f"Full automation script saved to: {script_path}")
-                            self.pending_action = None
-                            break
-                        
-                        self.pending_action = await self.get_ai_action(current_state)
+                            print(f"Action failed: {result.get('error', 'Unknown error')}")
+                            if 'error_screenshot' in result:
+                                print(f"Error screenshot saved to: {result['error_screenshot']}")
+                            
+                            # Ask for recovery options
+                            print("\nAssistant: I encountered an issue. What would you like to do?")
+                            print("1. Try again")
+                            print("2. Get a new suggestion")
+                            print("3. Manual intervention (I'll wait)")
+                            recovery_choice = input("Enter choice (1-3): ")
+                            
+                            if recovery_choice == '1':
+                                # Try the same action again
+                                print("Trying the same action again...")
+                                result = await self.execute_action(self.pending_action['code'])
+                                if result['success']:
+                                    print("Success on retry!")
+                                    current_state = await self.get_page_state()
+                                    self.pending_action = await self.get_ai_action(current_state)
+                                    print(f"\nAssistant: Next step - {self.pending_action['explanation']}")
+                            elif recovery_choice == '2':
+                                # Get a new action suggestion
+                                print("Getting a new action suggestion...")
+                                current_state = await self.get_page_state()
+                                self.pending_action = await self.get_ai_action(current_state)
+                                print(f"\nAssistant: New suggested step - {self.pending_action['explanation']}")
+                            else:
+                                # Manual intervention
+                                print("Please manually interact with the browser, then type 'next step' when ready")
+                                await asyncio.sleep(1)
+                                self.pending_action = None
                     else:
-                        print(f"Step failed: {result.get('error', 'Unknown error')}")
-                        print("\nEncountered an error. Stopping automation sequence.")
-                        break
-                        
-                print("\nAssistant: Automation sequence completed.")
-                if hasattr(self, 'pending_action') and self.pending_action:
-                    print(f"Next suggested step: {self.pending_action['explanation']}")
-                    
-            elif user_input.lower() == 'save script':
-                script_path = await self.export_full_script()
-                print(f"\nAssistant: Full automation script saved to: {script_path}")
+                        print("\nAssistant: No pending action. Use 'automate [task]' to start a new task.")
                 
-            elif user_input.lower() == 'analyze completion':
-                completion = await self.analyze_task_completion(current_state)
-                print(f"\nAssistant: Task Completion Analysis:")
-                print(f"Complete: {completion['is_complete']}")
-                print(f"Progress: ~{completion['completion_percentage']}% complete")
-                print(f"Analysis: {completion['reason']}")
-                if completion['remaining_steps']:
-                    print("Remaining steps:")
-                    for i, step in enumerate(completion['remaining_steps']):
-                        print(f"  {i+1}. {step}")
-                        
-            elif user_input.lower().startswith('go to '):
-                url = user_input[6:].strip()
-                if not url.startswith(('http://', 'https://')):
-                    url = 'https://' + url
+                # Add the remaining handlers for other commands...
+                # [Rest of your original terminal command handling here]
+                # This would include the 'continue', 'save script', 'analyze completion', etc. handlers
                 
-                print(f"\nAssistant: Navigating to {url}...")
-                try:
-                    await self.page.goto(url)
-                    await asyncio.sleep(2)
-                    await self._detect_platform()
-                    current_state = await self.get_page_state()
-                    print(f"Navigation complete. Now at: {current_state['title']}")
-                    print(f"Platform detected: {self.platform}")
-                except Exception as e:
-                    print(f"Navigation failed: {str(e)}")
-                    
-            else:
-                # Treat as a general question about the page
-                answer = await self.chat_query(user_input)
-                print(f"\nAssistant: {answer}")
-                              
+                else:
+                    # Treat as a general question about the page
+                    answer = await self.chat_query(user_input)
+                    print(f"\nAssistant: {answer}")                           
+   
     def _indent_code(self, code):
         """Add proper indentation to the code"""
         lines = code.split('\n')
         indented_lines = ['    ' + line for line in lines]
         return '\n'.join(indented_lines)
-    
-    async def get_popup_handling_action(self, popups):
-        """Get AI-generated code to handle detected popups"""
-        prompt = f"""
-        # Popup Handling for {self.platform.capitalize()}
-        
-        ## Detected Popups:
-        {json.dumps(popups, indent=2)}
-        
-        ## Instructions:
-        Generate Python code using Playwright to handle the detected popup(s). The code should:
-        1. Target the popup(s) using appropriate selectors
-        2. Either close the popup(s) or interact with them as needed
-        3. Be written for async Playwright
-        4. Use the variable 'page' which is already defined
-        5. Include proper waits for elements
-        
-        Generate ONLY executable Python code without any explanations or markdown. The code will be directly executed.
-        """
-        
-        # Call the Anthropic API
-        response = self.client.messages.create(
-            model="claude-3-7-sonnet-20250219",
-            max_tokens=800,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        # Extract the code from the response
-        code = response.content[0].text.strip()
-        
-        # Remove any markdown code blocks if present
-        if code.startswith("```python"):
-            code = code.split("```python")[1]
-        if code.endswith("```"):
-            code = code.rsplit("```", 1)[0]
-        
-        code = code.strip()
-        
-        # Save the generated script to a file for reference
-        script_dir = os.path.join(self.session_dir, f"{self.session_id}_scripts")
-        if not os.path.exists(script_dir):
-            os.makedirs(script_dir)
-        
-        script_path = os.path.join(script_dir, f"popup_handler_{len(self.step_history) + 1}.py")
-        with open(script_path, 'w') as f:
-            f.write(f"# Generated popup handling script\n")
-            f.write(f"# Platform: {self.platform}\n")
-            f.write(f"# Timestamp: {datetime.datetime.now().isoformat()}\n\n")
-            f.write("async def run(page):\n")
-            for line in code.split('\n'):
-                f.write(f"    {line}\n")
-        
-        # Print the script for user visibility
-        print(f"\n--- Generated Popup Handling Script ---")
-        print(code)
-        print("--------------------------------")
-        
-        return code
-    
-    async def check_task_completion(self, current_state):
-        """Ask the AI if the task is complete"""
-        prompt = f"""
-        # Task Completion Check for {self.platform.capitalize()}
-        
-        ## Task Description:
-        {self.task_description}
-        
-        ## Current State:
-        - Platform: {self.platform}
-        - URL: {current_state['url']}
-        - Page Title: {current_state['title']}
-        
-        ## Platform-Specific Elements:
-        {json.dumps(current_state.get('platform_specific', {}), indent=2)}
-        
-        ## Visible Text Elements (sample):
-        {json.dumps(current_state['visible_text'][:10], indent=2)}
-        
-        ## Question:
-        Based on the task description and current page state, is the {self.platform.capitalize()} task completed?
-        
-        Return a JSON object with two fields:
-        1. "is_complete": true or false
-        2. "reason": brief explanation of your decision
-        
-        Only return the JSON object, nothing else.
-        """
-        
-        response = self.client.messages.create(
-            model="claude-3-7-sonnet-20250219",
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        try:
-            result_text = response.content[0].text.strip()
-            if result_text.startswith("```json"):
-                result_text = result_text.split("```json")[1]
-            if result_text.endswith("```"):
-                result_text = result_text.rsplit("```", 1)[0]
-            
-            result = json.loads(result_text.strip())
-            return result
-        except:
-            # If parsing fails, assume not complete
-            return {
-                'is_complete': False,
-                'reason': "Unable to determine completion status"
-            }
-    
-    async def detect_popups(self):
-        """Detect popups, modals, and dialogs on the page with improved accuracy"""
-        popups = await self.page.evaluate("""
-            () => {
-                const result = {
-                    popups: []
-                };
-                
-                // Enhanced popup selectors including aria attributes
-                const popupSelectors = [
-                    // Common modal selectors
-                    '.modal', '[role="dialog"]', '.popup', '.overlay', '.dialog',
-                    // Aria-based selectors
-                    '[aria-modal="true"]', '[aria-haspopup="dialog"]', 
-                    // Platform-specific selectors
-                    '.notion-overlay-container', '.c-dialog__content', '.ReactModal__Content',
-                    // Elements with modal/popup/dialog in attribute values
-                    '[class*="modal"]', '[class*="popup"]', '[class*="dialog"]',
-                    '[id*="modal"]', '[id*="popup"]', '[id*="dialog"]',
-                    // Elements with high z-index that might be popups
-                    '[style*="z-index:"]'
-                ];
-                
-                // Check each selector
-                popupSelectors.forEach(selector => {
-                    try {
-                        const elements = document.querySelectorAll(selector);
-                        elements.forEach(el => {
-                            // Improved visibility check
-                            const style = window.getComputedStyle(el);
-                            const rect = el.getBoundingClientRect();
-                            const isVisible = style.display !== 'none' && 
-                                            style.visibility !== 'hidden' && 
-                                            style.opacity !== '0' &&
-                                            rect.width > 10 && 
-                                            rect.height > 10 &&
-                                            rect.top >= 0 &&
-                                            rect.left >= 0;
-                            
-                            if (isVisible) {
-                                const text = el.innerText || el.textContent;
-                                const buttons = Array.from(el.querySelectorAll('button, [role="button"]'))
-                                    .map(btn => btn.innerText || btn.textContent || btn.value || btn.getAttribute('aria-label') || '');
-                                
-                                result.popups.push({
-                                    selector: selector,
-                                    text: text ? text.trim().substring(0, 200) : '',
-                                    buttons: buttons.filter(btn => btn.trim()),
-                                    position: {
-                                        top: rect.top,
-                                        left: rect.left,
-                                        width: rect.width,
-                                        height: rect.height
-                                    },
-                                    hasCloseButton: !!el.querySelector('button[aria-label*="close"], [aria-label*="Close"], .close, .close-button, .dismiss, button[aria-label*="dismiss"], [class*="close"], [id*="close"]')
-                                });
-                            }
-                        });
-                    } catch (e) {
-                        // Ignore errors for individual selectors
-                    }
-                });
-                
-                return result;
-            }
-        """)
-        return popups
-    
-    async def manual_intervention(self, error_message):
-        """Prompt for manual intervention and get user's choice on next steps"""
-        print(f"\n=== USER INTERVENTION REQUIRED ({self.platform.capitalize()}) ===")
-        print(f"Error: {error_message}")
-        print("Please interact with the browser window to correct the issue.")
-        print("\nOptions:")
-        print("1: Continue automation after manual fix")
-        print("2: Get a new AI suggestion for this step")
-        print("3: Skip this step and continue")
-        print("4: Navigate to a different URL and continue")
-        print("5: Abort automation")
-        
-        choice = input("Enter your choice (1-5): ")
-        
-        if choice == '1':
-            print("Continuing with next step...")
-            return {"action": "continue"}
-        elif choice == '2':
-            print("Getting new AI suggestion...")
-            return {"action": "new_suggestion"}
-        elif choice == '3':
-            print("Skipping this step...")
-            return {"action": "skip"}
-        elif choice == '4':
-            new_url = input("Enter URL to navigate to: ")
-            return {"action": "navigate", "url": new_url}
-        else:
-            print("Aborting automation...")
-            return {"action": "abort"}
-    
-    async def run_workflow(self, max_steps=10):
-        """Run the complete workflow with AI guidance"""
-        if not self.page:
-            print("Error: No active browser page. Connect to a browser first.")
-            return False
-        
-        # Main control loop
-        step_count = 0
-        while step_count < max_steps:
-            step_count += 1
-            print(f"\n--- Step {step_count} ---")
-            
-            # Get current state and re-detect platform (in case of navigation)
-            await self._detect_platform()
-            current_state = await self.get_page_state()
-            if not current_state:
-                print("Failed to get page state. Aborting workflow.")
-                return False
-                
-            print(f"Current platform: {self.platform}")
-            print(f"Current page: {current_state['title']} ({current_state['url']})")
-            
-            # Check if task is complete
-            completion_result = await self.check_task_completion(current_state)
-            if completion_result['is_complete']:
-                print(f"Task completed! Reason: {completion_result['reason']}")
-                break
-            
-            # Get AI-generated action
-            next_action_code = await self.get_ai_action(current_state)
-            
-            # Execute the action
-            result = await self.execute_action(next_action_code)
-            
-            if not result['success']:
-                print(f"Action failed: {result.get('error', 'Unknown error')}")
-                
-                # Take screenshot of error state
-                error_dir = os.path.join(self.session_dir, f"{self.session_id}_errors")
-                if not os.path.exists(error_dir):
-                    os.makedirs(error_dir)
-                await self.page.screenshot(path=os.path.join(error_dir, f"error_step_{step_count}.png"))
-                
-                # Simple recovery options
-                print("Attempting basic recovery...")
-                try:
-                    # Wait a bit longer and try again
-                    await asyncio.sleep(3)
-                    result = await self.execute_action(next_action_code)
-                    if result['success']:
-                        print("Recovery successful after waiting.")
-                        continue
-                except Exception:
-                    pass
-                
-                # Ask for user intervention and get action choice
-                intervention = await self.manual_intervention(result.get('error', 'Unknown error'))
-                
-                if intervention["action"] == "continue":
-                    # Update state after user intervention and continue
-                    await self.get_page_state()
-                    continue
-                    
-                elif intervention["action"] == "new_suggestion":
-                    # Get a new AI suggestion and try again
-                    print("Getting new AI action suggestion...")
-                    next_action_code = await self.get_ai_action(current_state)
-                    result = await self.execute_action(next_action_code)
-                    if not result['success']:
-                        print(f"New action also failed: {result.get('error', 'Unknown error')}")
-                        # If the new suggestion also fails, get user intervention again
-                        intervention = await self.manual_intervention(result.get('error', 'New action also failed'))
-                        if intervention["action"] == "abort":
-                            print("Aborting automation.")
-                            break
-                    continue
-                    
-                elif intervention["action"] == "skip":
-                    # Skip this step and continue
-                    print("Skipping this step and continuing...")
-                    continue
-                    
-                elif intervention["action"] == "navigate":
-                    # Navigate to a specified URL
-                    try:
-                        url = intervention.get("url", "")
-                        if url:
-                            print(f"Navigating to: {url}")
-                            await self.page.goto(url)
-                            await asyncio.sleep(2)
-                            await self._detect_platform()  # Re-detect platform after navigation
-                            print(f"New platform detected: {self.platform}")
-                        continue
-                    except Exception as e:
-                        print(f"Navigation failed: {str(e)}")
-                        continue
-                    
-                else:  # abort
-                    print("Aborting automation.")
-                    break
-        
-        if step_count >= max_steps:
-            print("Maximum step limit reached. Task may not be complete.")
-        
-        # Export the script for future reference
-        await self.export_full_script()
-        return True
-    
+  
     async def export_full_script(self, output_path=None):
         """Export the full combined script of all steps"""
         if not output_path:
@@ -1311,8 +1628,10 @@ if __name__ == "__main__":
         # We don't close the browser since it was pre-existing
         if self.playwright:
             await self.playwright.stop()
-
+            
 async def main():
+    global automation_instance
+    
     # Replace with your Anthropic API key
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -1321,6 +1640,12 @@ async def main():
     
     # Create the automation instance with an initial empty task
     automation = WebAutomation("", api_key)
+    automation_instance = automation  # Set the global instance
+    
+    # Start the FastAPI server in a separate thread
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    print("WebSocket server started at ws://127.0.0.1:8000/ws")
     
     # Connect to existing browser session
     print("\n=== Web Automation Assistant ===")

@@ -439,6 +439,7 @@ class WebAutomation:
         except Exception as e:
             print(f"Error detecting forms: {str(e)}")
             return []  # Return an empty list instead of None or raising an error  
+        
     async def detect_clickable_elements(self):
         """Detect clickable elements"""
         clickables = await self.page.evaluate("""

@@ -4,3 +4,4 @@ __pycache__/
 playwright_session
 .env
 sessions
+duplicate copy.py

@@ -81,7 +81,7 @@ class WebAutomation:
             self.platform = "other"
             
     async def extract_all_potential_web_elements(self):
-        """Extract all potential UI elements from any web application without assuming specific class names"""
+        """Extract all potential UI elements from messaging web applications like WhatsApp, Telegram, etc."""
         web_elements = await self.page.evaluate("""
             () => {
                 const result = {
@@ -99,6 +99,17 @@ class WebAutomation:
                     // Interactive elements
                     all_buttons: [],
                     all_clickable_items: [],
+                    
+                    // Messaging-specific elements
+                    message_bubbles: [],
+                    chat_list_items: [],
+                    conversation_threads: [],
+                    message_timestamps: [],
+                    attachment_buttons: [],
+                    emoji_selectors: [],
+                    typing_indicators: [],
+                    read_receipts: [],
+                    media_content_areas: [],
                     
                     // Element counts by attribute
                     element_counts_by_class: {},
@@ -137,7 +148,7 @@ class WebAutomation:
                     if (el.innerText.trim().length < 40 && !el.innerText.includes('\\n')) {
                         const isUserElement = el.className.toLowerCase().includes('user') || 
                                             el.id.toLowerCase().includes('user') ||
-                                            el.closest('[class*="user"], [class*="avatar"], [class*="profile"]');
+                                            el.closest('[class*="user"], [class*="avatar"], [class*="profile"], [class*="contact"]');
                         if (isUserElement) {
                             result.all_user_elements.push({
                                 text: el.innerText.trim(),
@@ -159,8 +170,8 @@ class WebAutomation:
                     });
                 });
                 
-                // Get potential sidebars
-                document.querySelectorAll('aside, nav, div[class*="sidebar"], div[id*="sidebar"], div[class*="nav"], div[id*="nav"]').forEach(el => {
+                // Get potential sidebars (often contains chat lists in messaging apps)
+                document.querySelectorAll('aside, nav, div[class*="sidebar"], div[id*="sidebar"], div[class*="nav"], div[id*="nav"], div[class*="chat-list"], div[class*="conversation-list"]').forEach(el => {
                     result.all_sidebars.push({
                         classes: el.className,
                         id: el.id,
@@ -168,8 +179,8 @@ class WebAutomation:
                     });
                 });
                 
-                // Get potential input areas
-                document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"], div[class*="input"], div[class*="editor"], div[class*="composer"]').forEach(el => {
+                // Get potential input areas (message composers in messaging apps)
+                document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"], div[class*="input"], div[class*="editor"], div[class*="composer"], div[class*="message-input"], div[class*="chat-input"], footer textarea').forEach(el => {
                     result.all_input_areas.push({
                         tag: el.tagName,
                         classes: el.className,
@@ -179,8 +190,8 @@ class WebAutomation:
                     });
                 });
                 
-                // Get potential content containers
-                document.querySelectorAll('div[class*="content"], div[class*="main"], div[role="main"], main, article, section').forEach(el => {
+                // Get potential content containers (message areas in messaging apps)
+                document.querySelectorAll('div[class*="content"], div[class*="main"], div[role="main"], main, article, section, div[class*="messages"], div[class*="chat"], div[class*="conversation"]').forEach(el => {
                     result.all_content_containers.push({
                         classes: el.className,
                         id: el.id,
@@ -200,8 +211,173 @@ class WebAutomation:
                     });
                 });
                 
+                // MESSAGING-SPECIFIC ELEMENTS
+                
+                // Message bubbles - the actual message containers
+                document.querySelectorAll('div[class*="message"], div[class*="msg"], div[class*="bubble"], div[class*="chat-item"], [role="message"]').forEach(el => {
+                    // Check if it's likely a message bubble (not a container of messages)
+                    const isMessageBubble = el.querySelector('div[class*="message"], div[class*="bubble"]') === null || 
+                                            el.innerText.length < 1000;
+                                            
+                    if (isMessageBubble) {
+                        const isOutgoing = el.className.includes('out') || 
+                                        el.className.includes('sent') || 
+                                        el.className.includes('own') ||
+                                        el.getAttribute('data-is-outgoing') === 'true';
+                        
+                        result.message_bubbles.push({
+                            text: el.innerText.trim().substring(0, 100),
+                            classes: el.className,
+                            id: el.id,
+                            outgoing: isOutgoing,
+                            has_media: !!el.querySelector('img, video, audio, [class*="image"], [class*="video"], [class*="audio"]'),
+                            attrs: getDataAttributes(el)
+                        });
+                    }
+                });
+                
+                // Chat list items (conversations in the sidebar)
+                document.querySelectorAll('div[class*="chat-item"], div[class*="conversation"], div[class*="thread"], li[class*="chat"], [role="listitem"]').forEach(el => {
+                    // Ensure it's in a sidebar/list context
+                    const inListContext = el.closest('[class*="list"], [class*="sidebar"], [role="list"]');
+                    
+                    if (inListContext) {
+                        // Get user name if present
+                        const nameEl = el.querySelector('[class*="name"], [class*="title"], strong, b');
+                        const name = nameEl ? nameEl.innerText.trim() : '';
+                        
+                        // Get last message preview if present
+                        const previewEl = el.querySelector('[class*="preview"], [class*="snippet"], [class*="last-message"]');
+                        const preview = previewEl ? previewEl.innerText.trim().substring(0, 50) : '';
+                        
+                        // Get unread count if present
+                        const unreadEl = el.querySelector('[class*="unread"], [class*="badge"], [class*="count"]');
+                        const unreadCount = unreadEl ? unreadEl.innerText.trim() : '';
+                        
+                        result.chat_list_items.push({
+                            name: name,
+                            preview: preview,
+                            unread_count: unreadCount,
+                            classes: el.className,
+                            id: el.id,
+                            attrs: getDataAttributes(el)
+                        });
+                    }
+                });
+                
+                // Conversation threads (message container areas)
+                document.querySelectorAll('div[class*="conversation"], div[class*="chat"], div[class*="messages"], [role="log"]').forEach(el => {
+                    // Filter out sidebar conversation items
+                    const isMainChat = !el.closest('[class*="sidebar"], [class*="list"]') && 
+                                    el.querySelectorAll('[class*="message"], [class*="bubble"]').length > 0;
+                                    
+                    if (isMainChat) {
+                        result.conversation_threads.push({
+                            classes: el.className,
+                            id: el.id,
+                            message_count: el.querySelectorAll('[class*="message"], [class*="bubble"]').length,
+                            attrs: getDataAttributes(el)
+                        });
+                    }
+                });
+                
+                // Message timestamps
+                document.querySelectorAll('[class*="time"], [class*="timestamp"], [class*="date"], time').forEach(el => {
+                    const inMessageContext = el.closest('[class*="message"], [class*="bubble"]');
+                    if (inMessageContext) {
+                        result.message_timestamps.push({
+                            text: el.innerText.trim(),
+                            classes: el.className,
+                            id: el.id,
+                            attrs: getDataAttributes(el)
+                        });
+                    }
+                });
+                
+                // Attachment buttons (for media, files, etc.)
+                document.querySelectorAll('button[class*="attach"], [class*="clip"], [class*="file"], button[aria-label*="file"], button[aria-label*="image"], button[aria-label*="photo"], button[aria-label*="attach"]').forEach(el => {
+                    result.attachment_buttons.push({
+                        classes: el.className,
+                        id: el.id,
+                        aria_label: el.getAttribute('aria-label') || '',
+                        attrs: getDataAttributes(el)
+                    });
+                });
+                
+                // Emoji selectors
+                document.querySelectorAll('button[class*="emoji"], [class*="smile"], [class*="emotion"], button[aria-label*="emoji"], button[aria-label*="emoticon"], button[aria-label*="sticker"]').forEach(el => {
+                    result.emoji_selectors.push({
+                        classes: el.className,
+                        id: el.id,
+                        aria_label: el.getAttribute('aria-label') || '',
+                        attrs: getDataAttributes(el)
+                    });
+                });
+                
+                // Typing indicators
+                document.querySelectorAll('[class*="typing"], [class*="indicator"], [aria-label*="typing"]').forEach(el => {
+                    // Check if it's actually a typing indicator (typically contains dots animation)
+                    const isTypingIndicator = el.querySelector('[class*="dot"], [class*="ellipsis"]') !== null ||
+                                            el.innerText.includes('typing') ||
+                                            el.getAttribute('aria-label')?.includes('typing');
+                                            
+                    if (isTypingIndicator) {
+                        result.typing_indicators.push({
+                            classes: el.className,
+                            id: el.id,
+                            text: el.innerText.trim(),
+                            attrs: getDataAttributes(el)
+                        });
+                    }
+                });
+                
+                // Read receipts
+                document.querySelectorAll('[class*="tick"], [class*="check"], [class*="read"], [class*="receipt"], [aria-label*="read"], [aria-label*="seen"]').forEach(el => {
+                    // Filter to only get read indicators inside or near messages
+                    const nearMessage = el.closest('[class*="message"], [class*="bubble"]');
+                    if (nearMessage) {
+                        result.read_receipts.push({
+                            classes: el.className,
+                            id: el.id,
+                            aria_label: el.getAttribute('aria-label') || '',
+                            attrs: getDataAttributes(el)
+                        });
+                    }
+                });
+                
+                // Media content areas (images, videos, audio messages)
+                document.querySelectorAll('img, video, audio, [class*="media"], [class*="image-container"], [class*="voice-message"], [class*="audio-message"]').forEach(el => {
+                    // Make sure it's in a message context
+                    const inMessageContext = el.closest('[class*="message"], [class*="bubble"]');
+                    if (inMessageContext) {
+                        const mediaType = el.tagName === 'IMG' ? 'image' : 
+                                        el.tagName === 'VIDEO' ? 'video' : 
+                                        el.tagName === 'AUDIO' ? 'audio' : 
+                                        el.className.includes('voice') ? 'voice' : 'other';
+                                        
+                        result.media_content_areas.push({
+                            type: mediaType,
+                            classes: el.className,
+                            id: el.id,
+                            src: el.getAttribute('src') || '',
+                            attrs: getDataAttributes(el)
+                        });
+                    }
+                });
+                
+                // Status indicators (online status, away, etc.)
+                document.querySelectorAll('[class*="status"], [class*="presence"], [class*="online"], [class*="away"], [aria-label*="online"], [aria-label*="status"]').forEach(el => {
+                    result.all_status_indicators.push({
+                        classes: el.className,
+                        id: el.id,
+                        text: el.innerText.trim(),
+                        aria_label: el.getAttribute('aria-label') || '',
+                        attrs: getDataAttributes(el)
+                    });
+                });
+                
                 // Analyze data attributes
-                document.querySelectorAll('[data-qa], [data-test], [data-testid]').forEach(el => {
+                document.querySelectorAll('[data-qa], [data-test], [data-testid], [data-key], [data-id]').forEach(el => {
                     const dataAttrs = getDataAttributes(el);
                     Object.keys(dataAttrs).forEach(attr => {
                         const key = `${attr}:${dataAttrs[attr]}`;
@@ -226,7 +402,7 @@ class WebAutomation:
                 return result;
             }
         """)
-        return web_elements  
+        return web_elements 
     
     async def get_page_state(self):
         """Extract current page information"""

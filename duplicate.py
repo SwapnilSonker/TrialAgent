@@ -1511,7 +1511,7 @@ from playwright.async_api import async_playwright
 async def run_automation():
     async with async_playwright() as playwright:
         # Connect to existing browser with remote debugging
-        browser = await playwright.chromium.connect_over_cdp("http://localhost:9222")
+        browser = await playwright.chromium.connect_over_cdp("http://localhost:9223")
         context = browser.contexts[0]
         page = context.pages[0]
         
@@ -1566,10 +1566,10 @@ async def main():
     # Connect to existing browser session
     print("\n=== Web Automation Assistant ===")
     print("Connecting to browser...")
-    connection_successful = await automation.connect_to_existing_browser(debugging_port=9222)
+    connection_successful = await automation.connect_to_existing_browser(debugging_port=9223)
     if not connection_successful:
         print("Failed to connect to browser. Make sure Chrome is running with remote debugging enabled.")
-        print("Launch Chrome with: chrome.exe --remote-debugging-port=9222")
+        print("Launch Chrome with: chrome.exe --remote-debugging-port=9223")
         return
     
     # Start the chat interface
